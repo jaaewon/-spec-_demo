@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>전략 컴파일러 데모</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 720px;
+         margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  fieldset { border: 1px solid #8884; border-radius: 8px; margin: 0 0 1rem; padding: 1rem; }
+  label { display: block; margin: .75rem 0; }
+  label > span { display: block; font-size: .85rem; opacity: .75; margin-bottom: .25rem; }
+  select, input, textarea { width: 100%; padding: .5rem; font: inherit;
+                            border: 1px solid #8886; border-radius: 6px; background: transparent; color: inherit; }
+  button { padding: .6rem 1.4rem; font: inherit; font-weight: 600; border-radius: 6px;
+           border: 0; background: #2563eb; color: #fff; cursor: pointer; }
+  button[disabled] { opacity: .5; cursor: progress; }
+  pre { background: #8881; padding: 1rem; border-radius: 8px; overflow-x: auto; }
+  .err { color: #dc2626; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>전략 컴파일러 데모</h1>
+
+<form id="survey">
+  <fieldset>
+    <legend>설문</legend>
+
+    <label><span>관심 섹터/테마</span>
+      <select name="sector">
+        <option>반도체</option><option>2차전지</option><option>배당</option>
+        <option>대형주</option><option>코스닥</option><option>미국주식</option><option>채권</option>
+      </select>
+    </label>
+
+    <label><span>투자 성향</span>
+      <select name="risk">
+        <option value="conservative">안정형</option>
+        <option value="neutral" selected>중립형</option>
+        <option value="aggressive">공격형</option>
+      </select>
+    </label>
+
+    <label><span>감내 가능 손실</span>
+      <select name="max_loss">
+        <option value="3">3%</option>
+        <option value="5" selected>5%</option>
+        <option value="10">10%</option>
+      </select>
+    </label>
+
+    <label><span>매매 스타일</span>
+      <select name="style">
+        <option>추세추종(모멘텀)</option><option>역추세</option><option>이평선 교차</option>
+      </select>
+    </label>
+
+    <label><span>리밸런싱 주기</span>
+      <select name="rebalance">
+        <option value="weekly">주 1회</option>
+        <option value="monthly" selected>월 1회</option>
+        <option value="quarterly">분기 1회</option>
+      </select>
+    </label>
+
+    <label><span>자유 서술 (선택, 500자)</span>
+      <textarea name="note" rows="3" maxlength="500"></textarea>
+    </label>
+  </fieldset>
+
+  <button id="go">컴파일</button>
+</form>
+
+<h2>결과 Spec</h2>
+<pre id="out">설문을 제출하세요.</pre>
+
+<script>
+const form = document.getElementById('survey');
+const btn = document.getElementById('go');
+const out = document.getElementById('out');
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const body = Object.fromEntries(new FormData(form));
+  body.max_loss = Number(body.max_loss);
+
+  btn.disabled = true;
+  out.className = '';
+  // 로컬 8B라 30~60초 걸린다. 진행 표시가 없으면 멈춘 걸로 보임.
+  const t0 = Date.now();
+  const tick = setInterval(() => {
+    out.textContent = `컴파일 중... ${Math.round((Date.now() - t0) / 1000)}초`;
+  }, 200);
+
+  try {
+    const res = await fetch('/compile', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    clearInterval(tick);
+    if (!res.ok) {
+      out.className = 'err';
+      out.textContent = `${res.status} 거부됨\n\n` + JSON.stringify(data.detail, null, 2);
+    } else {
+      out.textContent = JSON.stringify(data.spec, null, 2);
+    }
+  } catch (err) {
+    clearInterval(tick);
+    out.className = 'err';
+    out.textContent = String(err);
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

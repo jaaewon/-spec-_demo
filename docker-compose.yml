@@ -1,0 +1,32 @@
+name: specdemo   # 디렉토리명이 '-'로 시작해 기본 프로젝트명이 무효라 고정
+
+services:
+  api:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      - DATABASE_URL=postgresql://demo:demo@db:5432/demo
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - OLLAMA_MODEL=qwen3:8b
+    volumes: ["./:/srv"]              # --reload 용, 매 수정마다 재빌드 방지
+    depends_on:
+      db: { condition: service_healthy }
+    extra_hosts: ["host.docker.internal:host-gateway"]  # 리눅스에서 호스트 Ollama 접근
+
+  db:
+    image: postgres:16
+    environment:
+      - POSTGRES_USER=demo
+      - POSTGRES_PASSWORD=demo
+      - POSTGRES_DB=demo
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d demo"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes: { pgdata: {} }

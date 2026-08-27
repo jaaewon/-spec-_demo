@@ -1,0 +1,15 @@
+[
+  { "name": "KODEX 200",         "theme": "대형주" },
+  { "name": "TIGER 200",         "theme": "대형주" },
+  { "name": "KODEX 반도체",       "theme": "반도체" },
+  { "name": "TIGER 반도체",       "theme": "반도체" },
+  { "name": "KODEX 2차전지산업",   "theme": "2차전지" },
+  { "name": "TIGER 2차전지테마",   "theme": "2차전지" },
+  { "name": "KODEX 코스닥150",     "theme": "코스닥" },
+  { "name": "TIGER 코스닥150",     "theme": "코스닥" },
+  { "name": "KODEX 배당가치",      "theme": "배당" },
+  { "name": "TIGER 배당성장",      "theme": "배당" },
+  { "name": "TIGER 미국S&P500",    "theme": "미국주식" },
+  { "name": "TIGER 미국나스닥100",  "theme": "미국주식" },
+  { "name": "KODEX 종합채권",      "theme": "채권" }
+]
