@@ -353,10 +353,16 @@ def validate_etfs(etfs: list[str], universe: set[str]) -> list[str]:
 ```sql
 CREATE TABLE requests (
     id          SERIAL PRIMARY KEY,
-    survey      JSONB NOT NULL,          -- 설문 응답 원본
+    -- 설문 응답 원본. 자유 입력 경로에서는 {mode:"free", text, slots} 가 들어간다 (§19)
+    survey      JSONB NOT NULL,
     nl_text     TEXT,                    -- 자유 서술/조합된 자연어
     created_at  TIMESTAMPTZ DEFAULT now()
 );
+-- ⚠️ survey 는 스키마가 없는 JSONB 라 저장 shape 이 코드와 함께 조용히 바뀔 수 있다.
+--    실제로 §19.3.1 의 slots 키 개명(evidence → matched_term)이 마이그레이션 없이
+--    적용돼 이 브랜치 이전 행과 이후 행의 키가 다르다. 데모라 down -v 로 초기화되므로
+--    영향이 없지만, requests 는 A-2(과거 실행 재현)의 입력 측 근거라 본 시스템에서는
+--    정책이 필요하다 — §16-13.
 
 -- 시스템 하드캡 프로파일 (§18). specs 가 FK 로 참조하므로 먼저 만든다.
 CREATE TABLE hardcap_profile (
@@ -656,6 +662,18 @@ curl -s -X POST localhost:8000/compile/free -H 'Content-Type: application/json' 
    `intent_lexicon.json` 과 같은 발상) 대조가 가능해지지만, 그러면 프롬프트 문구가
    데이터에서 생성돼 **설문 경로의 모델 출력이 달라진다**(§15 재현성 재검증 필요).
    그 비용을 치를지 결정 필요.
+13. **기록 테이블(`requests` / `specs`)의 저장 shape 변경 시 마이그레이션 정책**
+   — **현재는 데모라 미적용.** `docker compose down -v` 로 초기화되므로 실질적
+   영향이 없고, 이번 `slots` 키 개명(`evidence` → `matched_term`, §19.3.1)도
+   과거 행을 손대지 않은 채 진행했다.
+   그러나 `requests` 는 "그때 사용자가 무엇을 요청했는가"의 기록이고 상위 기획서
+   **A-2(과거 실행 재현)의 입력 측 근거**다. 저장 shape 이 코드 버전에 따라 갈리면
+   이력을 일괄 조회할 때 **코드가 여러 형식을 동시에 알아야 한다** — 형식 분기가
+   조회 계층에 쌓이고, 어느 행이 어느 형식인지는 `created_at` 으로 추측할 수밖에
+   없다. **본 시스템에서는 재현성 요구상 정책이 필요하다.**
+   검토 대상: JSONB 안에 shape 버전을 함께 박제(`specs.version`·`hardcap_version`
+   과 같은 발상), 또는 append-only 원장으로 두고 조회 시 버전별 어댑터를 태우는 방식.
+   **이번 판단을 선례로 굳히지 않는다.**
 
 ---
 
