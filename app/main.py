@@ -19,10 +19,10 @@ from datetime import date
 import ollama
 import psycopg
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from app.db import (hardcap_status, list_specs, load_active_hardcap_profile,
-                    save_request, save_spec, seed_hardcap_profile)
+                    save_request, save_spec, seed_hardcap_profile, get_spec)
 from app.indicators import get_indicators_as_of, indicators_status, seed_indicators
 from app.llm import compile_spec
 from app.prompt import build_user
