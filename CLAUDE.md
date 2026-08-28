@@ -18,18 +18,21 @@
 
 ### 포함
 - 사용자 요청 방식: **설문형** UI + 핸들러 (직접 구현)
+- **경제지표 조회** (`data/indicators.csv`) → Spec 생성 전 참고 컨텍스트로 프롬프트에 주입
 - 로컬 LLM 자체 판단 → Spec 생성 (구조화 출력 강제)
-- Spec 스키마 검증 (Pydantic 스키마 수준까지만)
+- Spec 스키마 검증 (Pydantic) + 유니버스/레버리지 검증 (`validators.py`)
+- **시스템 하드캡 검수** (`data/hardcaps.json`) → 스키마 통과 후 최종 게이트, 위반 시 거부
 - 원문 + Spec 저장 (PostgreSQL)
 
+파이프라인 순서: `설문 → 지표 조회 → 유니버스 주입 → LLM Spec 생성 → 스키마·유니버스 검증 → 하드캡 검수 → 저장`
+
 ### 제외 (이번 데모에서 구현하지 않음)
-- 시스템 하드캡 (max_loss 상한/MDD/리밸런싱 최소간격 등 코드 조건문) — 스키마 검증까지만
 - Building Block Library RAG (FAISS)
-- 경제지표 DB 조회 (피처 저장소)
 - 백테스팅 / 실전 거래 / 승인 게이트 / 리포트 생성
 - 되묻기(clarification) 다중턴 루프 — 설문이 슬롯을 채우므로 **1-shot**으로 처리 (필요 시 확장)
 
 ### 특징 / 제약
+- 지표 데이터(`indicators.csv`)는 **데모용 더미**. 실서비스에서는 동일 컬럼 구조로 실시간 수신하는 것을 전제로 한다.
 - **한국거래소(KRX) 상장 ETF만** 대상.
 - **레버리지/인버스 종목 제외** (`2X`, `레버리지`, `인버스`, `곱버스` 명칭 필터 + 유니버스 화이트리스트).
 
@@ -41,16 +44,18 @@
         ▼
 [FastAPI]
   1) 설문 응답 → 자연어/슬롯 프롬프트 구성
-  2) etf_universe.json 주입
-  3) Ollama 호출 (format = StrategySpec JSON Schema, temperature=0)
+  2) indicators.csv 조회 (설문 섹터 + 최신 영업일로 필터) → 프롬프트에 주입
+  3) etf_universe.csv 주입
+  4) Ollama 호출 (format = StrategySpec JSON Schema, temperature=0)
         │
         ▼
 [Ollama: Qwen 3.6]  ── 문법 제약으로 스키마 밖 출력 생성 불가
         │  JSON 문자열
         ▼
-  4) Pydantic 검증 (스키마 + ETF 유니버스/레버리지 validator)
-  5) version/snapshot/seed 박제
-  6) PostgreSQL 저장 (requests + specs)
+  5) Pydantic 검증 (스키마 + ETF 유니버스/레버리지 validator)
+  6) hardcaps.json 검수 ── 위반 시 400 (§8)
+  7) version/snapshot/seed 박제
+  8) PostgreSQL 저장 (requests + specs)
         │
         ▼
 [Browser: Spec JSON 렌더링]
@@ -165,27 +170,54 @@ class StrategySpec(BaseModel):
 
 ## 7. ETF 유니버스 처리
 
-- **`data/etf_universe.json`** (정적 화이트리스트). 프롬프트에 종목명 주입 + validator 근거로 사용.
-- 스타터(대표 KRX 비레버리지 ETF — **종목코드는 KRX/데이터 제공처에서 검증 후 확정**):
+- **`data/etf_universe.csv`** (정적 화이트리스트, `name,code,theme` 3컬럼). 프롬프트에 종목명 주입 + validator 근거로 사용.
+- 현재 20종 (KRX 비레버리지 — **종목코드는 KRX/데이터 제공처에서 검증 후 확정**):
 
-```json
-[
-  {"name": "KODEX 200",        "code": "069500", "theme": "대형주"},
-  {"name": "TIGER 200",        "code": "102110", "theme": "대형주"},
-  {"name": "KODEX 반도체",      "code": "091160", "theme": "반도체"},
-  {"name": "TIGER 반도체",      "code": "091230", "theme": "반도체"},
-  {"name": "KODEX 2차전지산업",  "code": "305720", "theme": "2차전지"},
-  {"name": "KODEX 코스닥150",    "code": "229200", "theme": "코스닥"},
-  {"name": "KODEX 배당가치",     "code": "325020", "theme": "배당"},
-  {"name": "TIGER 미국S&P500",   "code": "360750", "theme": "미국주식"},
-  {"name": "KODEX 종합채권",     "code": "273130", "theme": "채권"}
-]
+```csv
+name,code,theme
+KODEX 반도체,091160,반도체
+TIGER 반도체,091230,반도체
+TIGER Fn반도체TOP10,396500,반도체
+KODEX 2차전지산업,305720,2차전지
+TIGER 2차전지테마,305540,2차전지
+TIGER 2차전지소재Fn,462010,2차전지
+KODEX 고배당주,279530,배당
+KODEX 코리아배당성장,211900,배당
+RISE 고배당,266160,배당
+KODEX 200,069500,대형주
+TIGER 200,102110,대형주
+KODEX 코스피100,237350,대형주
+KODEX 코스닥150,229200,코스닥
+TIGER 코스닥150,232080,코스닥
+TIGER 미국S&P500,360750,미국주식
+KODEX 미국S&P500,379800,미국주식
+TIGER 미국나스닥100,133690,미국주식
+KODEX 국고채10년액티브,471230,채권
+TIGER 미국채10년선물,305080,채권
+KODEX 미국채10년선물,308620,채권
 ```
+
+**CSV 취급 규칙** (팀원 공통 — 안 지키면 조용히 깨진다):
+- `theme` 값은 `schemas.py`의 `Sector` enum 문자열과 **정확히 일치**해야 한다 (프롬프트에서 문자열 매칭으로 후보를 좁히므로). 현재 7종: 반도체 / 2차전지 / 배당 / 대형주 / 코스닥 / 미국주식 / 채권.
+- `code`는 **문자열로 다룬다**. `069500`처럼 앞자리 0이 있어 숫자로 파싱하면 `69500`이 되고, 코드 기준 조인이 에러 없이 0건 매칭된다. `csv` 모듈은 전부 str로 읽어 안전하나, pandas를 쓴다면 `dtype={"code": str}` 필수.
+- 읽을 때 `encoding="utf-8-sig"`. Excel로 저장하면 BOM(`﻿`)이 붙고, 그냥 `utf-8`로 읽으면 첫 컬럼 키가 `'﻿name'`이 돼 `row["name"]`이 KeyError로 터진다.
+
 > 데모용 9~30종목이면 충분. 확장 시 명칭에 `레버리지/인버스/2X/곱버스` 포함 종목은 로드 단계에서 제외.
+
+### 경제지표 (`data/indicators.csv`)
+
+`date,name,code,close,volume,momentum_20d,rsi_14,ma_cross_5_20` — 유니버스 20종 × 최근 7영업일 = 140행. `name` 기준으로 유니버스와 조인한다 (양쪽 종목명·코드 완전 일치 확인됨). 위 CSV 취급 규칙(`utf-8-sig`, `code`는 str)이 그대로 적용된다.
+
+- **프롬프트에는 전량이 아니라 필터해서 넣는다**: 설문 `sector` == 유니버스 `theme` + 최신 영업일 → 3행 내외. 140행을 통째로 넣으면 ~7KB 노이즈다.
+- **`snapshot_date`(오늘)로 조회하면 빈 결과가 나온다.** 데이터 최신일은 직전 영업일이다. 조회 기준은 `max(date)`로 잡을 것.
+- **`ma_cross_5_20`은 문자열**(`golden`/`neutral`/`dead`)인데 `SignalRule.threshold`는 `float`이다. "이평선 교차" 스타일로 생성된 signal을 이 컬럼에 그대로 적용할 수 없다 → 지표 CSV 쪽을 `1/0/-1`로 바꾸는 게 스키마를 건드리는 것보다 싸다. **미해결**.
+- `SignalRule.indicator`는 자유 문자열이라 LLM이 이 3종 밖의 지표명을 만들 수 있다. 조회 시 KeyError 방어 필요 (또는 `indicator`를 Enum 3종으로 승격).
 
 ## 8. 서버측 검증 (Pydantic validator)
 
-스키마 통과 후에도 아래를 강제 (하드캡은 제외, **유니버스/레버리지 무결성만**):
+스키마 통과 후 두 단계를 더 거친다: **① 유니버스/레버리지 무결성 → ② 하드캡 검수**.
+
+### ① 유니버스/레버리지 (`validators.py`)
 
 ```python
 LEVERAGE_KEYWORDS = ("레버리지", "인버스", "2X", "곱버스")
@@ -199,6 +231,21 @@ def validate_etfs(etfs: list[str], universe: set[str]) -> list[str]:
     return etfs
 ```
 - 실패 시: 400 + 사유 반환 (데모에선 1회 재시도 정도만, 무한 루프 금지).
+
+### ② 하드캡 검수 (`data/hardcaps.json`)
+
+유니버스 검증까지 통과한 Spec을 마지막으로 훑는 게이트. 규칙 4개뿐이므로 **범용 룰 엔진을 만들지 말고 조건문 4개로 읽는다** (형식은 나중에 엔진으로 승격 가능하게 선언형으로 둔 것).
+
+| 규칙 `type` | 대상 필드 | 내용 |
+|---|---|---|
+| `upper_bound_by_profile` | `max_loss_pct` | 성향별 상한 (conservative 8 / neutral 15 / aggressive 30) 초과 시 거부 |
+| `count_range` | `etfs` | 종목 수 1~5 |
+| `count_range` | `signals` | 신호 규칙 수 1~5 |
+| `min_interval_by_profile` | `rebalance` | 성향이 허용하는 **가장 잦은** 주기보다 잦으면 거부 |
+
+- `min_interval_by_profile` 주의: 값(`conservative: "monthly"`)은 "허용되는 가장 잦은 주기"다. `rebalance_order`(`weekly < monthly < quarterly`)에서 **인덱스를 비교**해 `idx(spec) < idx(min_allowed)`면 거부. 필드명만 보고 부등호를 뒤집기 쉬우니 주의.
+- 위반 시: `on_violation: "reject"` → 400 + 규칙의 `message` 반환.
+- 설문 선택지(감내 손실 3/5/10%)와 상한이 겹친다: **안정형 + 10%는 항상 거부**된다. 하드캡 동작 시연용으로 의도된 조합.
 
 ## 9. API 설계 (FastAPI)
 
@@ -286,7 +333,9 @@ volumes: { pgdata: {} }
 │   ├── db.py                 # Postgres 연결/저장/조회
 │   └── validators.py         # 유니버스/레버리지 검증
 ├── data/
-│   └── etf_universe.json
+│   ├── etf_universe.csv      # 유니버스 화이트리스트 (name,code,theme) — §7
+│   ├── indicators.csv        # 경제지표 더미 (date,name,code,close,volume,momentum_20d,rsi_14,ma_cross_5_20)
+│   └── hardcaps.json         # Spec 사후 검증용 하드캡 규칙
 └── static/
     └── index.html
 ```
@@ -294,7 +343,7 @@ volumes: { pgdata: {} }
 ## 14. 구현 순서 (2시간 타임박스)
 
 1. **(15m)** 스캐폴딩: compose 기동, Postgres 테이블, `/health` 확인.
-2. **(20m)** `schemas.py` + `etf_universe.json` 작성.
+2. **(20m)** `schemas.py` + `etf_universe.csv` 작성.
 3. **(30m)** `llm.py`: Ollama `format` 호출 → Pydantic 파싱, temperature 0.
 4. **(20m)** `validators.py` + `/compile` 엔드포인트 (검증·저장 연결).
 5. **(20m)** `index.html` 설문 폼 + 결과 렌더.
@@ -305,6 +354,9 @@ volumes: { pgdata: {} }
 - 정상: "반도체 + 공격형 + 모멘텀 + 월1회" → 반도체 ETF, momentum signal, monthly Spec 생성.
 - 경계: 자유서술로 "레버리지 반도체 담아줘" → validator가 거부 (레버리지 차단 입증).
 - 경계: 유니버스에 없는 종목 유도 → 거부 or 유니버스 내 대체.
+- 하드캡: "안정형 + 감내 손실 10%" → 하드캡 상한(8%) 위반으로 거부 (§8-②).
+- 하드캡: "안정형 + 주 1회 리밸런싱" → 성향 대비 과도하게 잦아 거부.
+- 지표 반영: "2차전지 + 모멘텀" → indicators상 momentum_20d가 음수(-0.05 내외)인 구간이므로 rationale에 그 판단이 드러나는지 확인.
 - 무결성: 같은 설문 2회 → 스키마 항상 유효(온도 0으로 재현성↑).
 
 ## 16. 확인 필요 사항 (Open Decisions)

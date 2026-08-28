@@ -15,24 +15,34 @@ CLAUDE.md §2 에 따라 하드캡(최대손실 상한, MDD 등)은 이번 데�
 여기서는 '유니버스/레버리지 무결성'만 본다.
 """
 
-import json
+import csv
 from pathlib import Path
 
 # __file__ = /srv/app/validators.py → .parent = /srv/app → .parent.parent = /srv
 # 이렇게 파일 위치 기준으로 경로를 잡으면 어느 디렉토리에서 실행하든 동작한다.
-UNIVERSE_PATH = Path(__file__).parent.parent / "data" / "etf_universe.json"
+UNIVERSE_PATH = Path(__file__).parent.parent / "data" / "etf_universe.csv"
 
 LEVERAGE_KEYWORDS = ("레버리지", "인버스", "2X", "곱버스")
 
 
 def load_universe(path: Path = UNIVERSE_PATH) -> list[dict]:
-    """화이트리스트 로드. 레버리지/인버스는 로드 단계에서 걸러 프롬프트에 아예 노출하지 않는다.
+    """화이트리스트 로드 (CSV: name,code,theme). 반환값은 {"name","code","theme"} dict 목록.
 
-    지금 etf_universe.json 에는 레버리지 종목이 없으므로 이 필터는 아무것도 안 거른다.
+    레버리지/인버스는 로드 단계에서 걸러 프롬프트에 아예 노출하지 않는다.
+    지금 etf_universe.csv 에는 레버리지 종목이 없으므로 이 필터는 아무것도 안 거른다.
     유니버스를 나중에 확장할 때(예: KRX 전체 목록을 긁어올 때) 자동으로 막히도록
     미리 걸어둔 안전장치.
+
+    encoding="utf-8-sig" 인 이유: Excel 로 저장한 CSV 는 맨 앞에 BOM(\\ufeff)이 붙는다.
+        그냥 "utf-8" 로 읽으면 첫 컬럼 키가 'name' 이 아니라 '\\ufeffname' 이 돼서
+        row["name"] 이 KeyError 로 터진다. -sig 는 BOM 이 있으면 떼고 없으면 그냥 넘어간다.
+    newline="" 인 이유: csv 모듈이 줄바꿈(CRLF 포함)을 직접 처리하게 두는 표준 사용법.
+
+    code 는 문자열 그대로 둔다 — "069500" 처럼 앞자리 0 이 있어서 숫자로 바꾸면 69500 이 된다.
+    (csv 모듈은 전부 str 로 읽으므로 별도 처리 불필요. pandas 를 쓸 땐 dtype={"code": str} 필수)
     """
-    items = json.loads(path.read_text(encoding="utf-8"))
+    with path.open(encoding="utf-8-sig", newline="") as f:
+        items = [row for row in csv.DictReader(f) if row.get("name")]  # 끝의 빈 줄 방어
     return [it for it in items if not _is_leveraged(it["name"])]
 
 
@@ -72,8 +82,12 @@ def _is_leveraged(name: str) -> bool:
 if __name__ == "__main__":
     uni = load_universe()
     names = {it["name"] for it in uni}
-    assert len(uni) == 13, len(uni)
+    assert len(uni) == 20, len(uni)
     assert "KODEX 반도체" in names
+    # 앞자리 0 이 살아있는지 (숫자로 파싱되면 "69500" 이 된다)
+    assert next(it["code"] for it in uni if it["name"] == "KODEX 200") == "069500"
+    # theme 은 프롬프트에서 설문 sector 와 문자열로 매칭되므로 비어 있으면 안 된다
+    assert all(it["theme"] for it in uni)
 
     assert validate_etfs(["KODEX 반도체", "TIGER 200"], names)
 
