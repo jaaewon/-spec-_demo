@@ -38,6 +38,7 @@ curl localhost:8000/health
 | GET | `/` | 설문 UI |
 | POST | `/compile` | 설문 → Spec JSON (+ 하드캡 조정 내역 `clamps`) |
 | GET | `/specs` | 저장 이력 (원문 + Spec) |
+| GET | `/indicators?as_of=` | 해당 시점에 공개돼 있던 경제지표 (CLAUDE.md §17) |
 | GET | `/health` | Ollama·DB·지표·하드캡 상태 |
 
 ## 셀프체크
@@ -45,6 +46,7 @@ curl localhost:8000/health
 ```bash
 docker compose exec api python -m app.schemas      # 스키마
 docker compose exec api python -m app.validators   # 유니버스/레버리지 차단 + 하드캡
+docker compose exec api python -m app.indicators   # 경제지표 as-of 조회
 docker compose exec api python -m app.llm          # 실제 LLM 호출 (1~2분)
 ```
 
