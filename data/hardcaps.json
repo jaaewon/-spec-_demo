@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "description": "StrategySpec 사후 검증용 하드캡. field는 StrategySpec 필드명과 일치.",
+  "rebalance_order": [
+    "weekly",
+    "monthly",
+    "quarterly"
+  ],
+  "rules": [
+    {
+      "field": "max_loss_pct",
+      "type": "upper_bound_by_profile",
+      "limit_by_profile": {
+        "conservative": 8,
+        "neutral": 15,
+        "aggressive": 30
+      },
+      "on_violation": "reject",
+      "message": "손실 한도 초과 (risk_profile 상한 위반)"
+    },
+    {
+      "field": "etfs",
+      "type": "count_range",
+      "min_count": 1,
+      "max_count": 5,
+      "on_violation": "reject",
+      "message": "종목 수 한도 위반 (1~5)"
+    },
+    {
+      "field": "rebalance",
+      "type": "min_interval_by_profile",
+      "note": "min_allowed = 각 성향이 허용하는 가장 잦은 주기. 이보다 잦으면 거부.",
+      "min_allowed_by_profile": {
+        "conservative": "monthly",
+        "neutral": "weekly",
+        "aggressive": "weekly"
+      },
+      "on_violation": "reject",
+      "message": "리밸런싱 주기 위반 (성향 대비 과도하게 잦음)"
+    },
+    {
+      "field": "signals",
+      "type": "count_range",
+      "min_count": 1,
+      "max_count": 5,
+      "on_violation": "reject",
+      "message": "신호 규칙 수 한도 위반 (1~5)"
+    }
+  ]
+}

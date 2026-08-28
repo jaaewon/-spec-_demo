@@ -89,7 +89,7 @@ class StrategySpec(BaseModel):
     rationale: str = Field(description="선정 근거 1~2문장 (한국어)")
 
     # 여기서 ETF 이름까지 검증하지 않는 이유:
-    # 유니버스 목록은 data/etf_universe.json 에서 읽는 '데이터'라 스키마에 박을 수 없다.
+    # 유니버스 목록은 data/etf_universe.csv 에서 읽는 '데이터'라 스키마에 박을 수 없다.
     # 그래서 종목 검증만 app/validators.py 로 분리했다 (CLAUDE.md §8).
 
 
@@ -101,7 +101,7 @@ class StrategySpec(BaseModel):
 class Sector(str, Enum):
     """설문의 섹터 선택지.
 
-    값이 etf_universe.json 의 "theme" 과 **똑같은 문자열**이어야 한다.
+    값이 etf_universe.csv 의 "theme" 과 **똑같은 문자열**이어야 한다.
     프롬프트에 "관심 섹터: 반도체" 와 "- KODEX 반도체 (반도체)" 가 같이 들어가서
     모델이 문자열 매칭으로 후보를 좁히기 때문.
     """
