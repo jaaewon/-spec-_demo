@@ -23,9 +23,20 @@
 - 원문 + Spec 저장 (PostgreSQL)
 - **경제지표 피처 저장소 (as-of 조회)** — 상위 기획서 P1 "피처 저장소" 마일스톤의 선행 PoC.
   정적 seed 적재 + 시점 정합적 조회(§17)까지. 프롬프트 주입·시장온도 판정은 안 함
+- **시스템 하드캡 (Validator 4계층)** — 기획서 4.1 의 4번째 계층(§18).
+  **수치는 클램프(200), 구조적 위반은 반려(400).** 캡 값은 코드 상수가 아니라
+  `hardcap_profile` 테이블에서 요청마다 읽는다. **LLM 프롬프트에는 넣지 않는다** (§18.2)
+  - 실제 발동: `max_loss_pct` 상한 · 논리 모순 반려
+  - 값만 저장하고 판정은 스텁 3종 — 아래 "제외" 참고
 
 ### 제외 (이번 데모에서 구현하지 않음)
-- 시스템 하드캡 (max_loss 상한/MDD/리밸런싱 최소간격 등 코드 조건문) — 스키마 검증까지만
+- 하드캡 **스텁 3종** — `hardcap_profile` 에 값은 있으나 검증 로직은 "판정 불가"를 반환한다.
+  (조용히 통과시키지 않는다. 통과와 판정 불가를 구분하는 게 중요하다)
+  | 항목 | 미적용 사유 | 재검토 시점 |
+  |---|---|---|
+  | MDD 상한 | 데모에 백테스트 계층이 없어 MDD 를 **산출할 수 없다**. Spec 만 보고는 판정 불가 | P3 백테스트 |
+  | 최소 리밸런싱 간격 | 로직은 살아 있으나 현행 `RebalanceFreq` 최소 단위가 `weekly`(7일)이고 캡도 7일이라 **어떤 설문 응답도 위반할 수 없다**. 캡을 올리면 '주 1회' 선택지가 항상 클램프돼 정상 응답이 매번 조정된다 | enum 에 더 짧은 주기 추가 시 자동 발동 |
+  | 단일종목 상한 | **현행 `StrategySpec` 에 종목별 비중 필드가 없다.** ETF 라서 불필요한 게 아니다 — ETF 내부 분산과 포트폴리오 내 ETF 비중은 별개 문제이고, 반도체 ETF 100% 배분은 여전히 섹터 집중 위험이다. 스키마 변경은 이번 범위 밖 | P3 배분 계층 |
 - Building Block Library RAG (FAISS)
 - 경제지표의 **소비** — 프롬프트 주입, 임계값 기반 시장온도/국면 판정 (판단 계층 소속, §17)
 - 경제지표 **실제 API 연동** (ECOS/FRED) — 교체 지점만 함수 경계로 끊어둠 (§17)
@@ -51,10 +62,12 @@
 [Ollama: Qwen 3.6]  ── 문법 제약으로 스키마 밖 출력 생성 불가
         │  JSON 문자열
         ▼
-  4) Pydantic 검증 (스키마 + ETF 유니버스/레버리지 validator)
+  4) Pydantic 검증 (스키마 + ETF 유니버스/레버리지 validator)   ← 1~2계층, 실패 시 1회 재시도
+  4-1) 하드캡 적용 (§18) — 수치는 클램프, 구조적 위반은 400.    ← 4계층, **재시도 루프 밖**
+       하드캡 값은 프롬프트에 안 들어간다 (LLM 은 상한을 모른다)
   5) version/snapshot/seed 박제
   5-1) snapshot_date 를 as-of 키로 경제지표 조회 (§17) — 프롬프트엔 안 넣음, 기록만
-  6) PostgreSQL 저장 (requests + specs, 지표 스냅샷 동봉)
+  6) PostgreSQL 저장 (requests + specs, 지표 스냅샷 + 조정 내역 동봉)
         │
         ▼
 [Browser: Spec JSON 렌더링]
@@ -187,9 +200,18 @@ class StrategySpec(BaseModel):
 ```
 > 데모용 9~30종목이면 충분. 확장 시 명칭에 `레버리지/인버스/2X/곱버스` 포함 종목은 로드 단계에서 제외.
 
-## 8. 서버측 검증 (Pydantic validator)
+## 8. 서버측 검증 — Validator 계층 구조
 
-스키마 통과 후에도 아래를 강제 (하드캡은 제외, **유니버스/레버리지 무결성만**):
+기획서 4.1 의 4계층 중 이 데모가 구현한 건 **1·2·4계층**이다.
+
+| # | 계층 | 무엇을 보나 | 어디 | 실패 시 |
+|---|---|---|---|---|
+| 1 | 스키마 | 형태(타입·enum·범위) | `schemas.py` + Ollama `format` 문법 제약 | 애초에 생성 불가 |
+| 2 | 참조 | 종목명이 유니버스에 실재하는가 | `validators.validate_etfs` | **반려 400** (1회 재시도 후) |
+| 3 | 논리 | 규칙끼리 모순되지 않는가 | (전용 계층 없음 — 4계층 진입부의 `find_logical_contradictions` 가 겸함) | **반려 400** |
+| 4 | 하드캡 | 시스템 상한을 넘지 않는가 | `validators.enforce_hardcaps` (§18) | **클램프 200** / 구조적 위반만 반려 400 |
+
+### 8.1 2계층 (참조) — 기존 그대로
 
 ```python
 LEVERAGE_KEYWORDS = ("레버리지", "인버스", "2X", "곱버스")
@@ -204,6 +226,25 @@ def validate_etfs(etfs: list[str], universe: set[str]) -> list[str]:
 ```
 - 실패 시: 400 + 사유 반환 (데모에선 1회 재시도 정도만, 무한 루프 금지).
 
+### 8.2 4계층 (하드캡) — 클램프와 반려의 구분
+
+**두 계층의 실패 처리가 다른 이유**가 이 설계의 핵심이다.
+
+- **참조 계층은 전부 반려한다.** 유니버스 밖 종목은 고쳐 줄 방법이 없다 —
+  어느 종목으로 바꿔야 사용자 의도에 맞는지 서버가 알 수 없다.
+- **하드캡 계층은 수치만 조정한다.** "손실 50% 감수"는 의도가 명확하니 상한으로
+  깎아 살려주는 게 맞다. 사용자는 원하는 걸 얻고(200), 시스템은 상한을 지킨다.
+
+| 위반 유형 | 처리 | 예 |
+|---|---|---|
+| **수치 초과** | **클램프 → 200.** 상한값으로 조정하고 내역을 `clamps` 에 기록 | `max_loss_pct: 50 → 20` |
+| **구조적 위반** | **반려 → 400 + 사유.** 깎을 수치가 없다 | 동일 조건에 buy/sell 동시 지정 |
+
+구조적 위반을 클램프하지 않는 이유: 모순된 규칙 중 하나를 서버가 임의로 골라 지우면
+사용자가 요청하지 않은 전략이 만들어진다. 그건 조정이 아니라 조작이다.
+
+자세한 내용(캡 값 근거, 프로파일 테이블, 스텁 3종)은 **§18**.
+
 ## 9. API 설계 (FastAPI)
 
 | 메서드 | 경로 | 설명 |
@@ -212,7 +253,7 @@ def validate_etfs(etfs: list[str], universe: set[str]) -> list[str]:
 | POST | `/compile` | 설문 응답 → LLM → 검증 → 저장 → Spec JSON 반환 |
 | GET | `/specs` | 저장된 Spec 목록 (검증/데모 확인용) |
 | GET | `/indicators?as_of=YYYY-MM-DD` | 해당 시점에 **공개돼 있던** 최신 경제지표 (§17). 생략 시 오늘 |
-| GET | `/health` | Ollama·DB·지표 테이블 헬스체크 |
+| GET | `/health` | Ollama·DB·지표 테이블·하드캡 프로파일 헬스체크 |
 
 `POST /compile` 요청/응답 예:
 ```jsonc
@@ -221,12 +262,34 @@ def validate_etfs(etfs: list[str], universe: set[str]) -> list[str]:
   "style": "momentum", "rebalance": "monthly", "note": "" }
 // res
 { "request_id": 12,
+  // **하드캡 클램프가 적용된 최종본.** 조정이 있었으면 아래 clamps 와 대조해서 읽는다.
   "spec": { ...StrategySpec... },
   // spec.snapshot_date 기준 as-of 로 뜬 경제지표 스냅샷 (§17).
   // 프롬프트에는 안 들어간다. 지표를 못 읽으면 {} — /compile 은 그래도 200.
   "indicators": { "KR_CPI_YOY": { "value": 2.4, "observation_date": "2026-07-01",
-                                  "release_date": "2026-08-21", ... } } }
+                                  "release_date": "2026-08-21", ... } },
+  // 하드캡 조정 내역 (§18). **조정이 없으면 빈 배열** — 정상 요청의 기본 상태다.
+  // 이 배열이 비어 있지 않아도 요청은 성공(200)이다. 거부가 아니라 조정이다.
+  "clamps": [ { "field": "max_loss_pct",       // 어떤 필드가
+                "requested": 25.0,             // 어떤 값에서
+                "applied": 20.0,               // 어떤 값으로
+                "cap": "max_loss_pct_cap",     // 어떤 캡 때문에
+                "limit": 20.0,
+                "reason": "1회 손실 한도 상한 20% 초과 (25%) — 상한값으로 조정" } ] }
 ```
+
+**상태 코드 정리**
+
+| 코드 | 언제 | 예 |
+|---|---|---|
+| 200 | 정상 + **하드캡 수치 클램프** | `clamps` 가 비었거나 조정 내역이 담긴다 |
+| 400 | 참조 계층 반려 / 하드캡 **구조적 위반** | 유니버스 밖 종목, 동일 조건 buy·sell 동시 |
+| 422 | `SurveyRequest` 스키마 위반 (LLM 호출 전) | enum 밖 섹터 |
+| 503 | Ollama 장애 / **하드캡 프로파일 조회 실패** | 아래 참고 |
+
+> 하드캡 프로파일을 못 읽으면 **503 (fail closed)**. 지표 계층이 실패해도 `{}` 로 넘어가
+> 200 을 내는 것(§17)과 의도적으로 반대다 — 지표는 부가정보지만 하드캡은 안전 계층이라,
+> 조용히 사라진 채로 Spec 을 내보내는 게 에러보다 나쁘다.
 
 ## 10. DB 스키마 (PostgreSQL)
 
@@ -238,13 +301,26 @@ CREATE TABLE requests (
     created_at  TIMESTAMPTZ DEFAULT now()
 );
 
+-- 시스템 하드캡 프로파일 (§18). specs 가 FK 로 참조하므로 먼저 만든다.
+CREATE TABLE hardcap_profile (
+    version               INT PRIMARY KEY,   -- 활성 버전 = MAX(version)
+    max_loss_pct_cap      NUMERIC NOT NULL,  -- 1회 손실 한도 상한 (%) — 클램프 발동
+    mdd_pct_cap           NUMERIC NOT NULL,  -- MDD 상한 (%) — 스텁
+    min_rebalance_days    INT     NOT NULL,  -- 리밸런싱 최소 간격 (일) — 현행 값으론 미발동
+    single_etf_weight_cap NUMERIC NOT NULL,  -- 단일종목 비중 상한 (%) — 스텁
+    note                  TEXT,
+    created_at            TIMESTAMPTZ DEFAULT now()
+);
+
 CREATE TABLE specs (
     id          SERIAL PRIMARY KEY,
     request_id  INT REFERENCES requests(id),
-    spec        JSONB NOT NULL,          -- StrategySpec JSON
+    spec        JSONB NOT NULL,          -- StrategySpec JSON (**클램프 적용된 최종본**)
     version     INT NOT NULL DEFAULT 1,
     model       TEXT,                    -- 사용 모델 태그
     indicators  JSONB NOT NULL DEFAULT '{}'::jsonb,  -- snapshot_date 기준 지표 스냅샷 (§17)
+    clamps      JSONB NOT NULL DEFAULT '[]'::jsonb,  -- 하드캡 조정 내역 (§18), 없으면 []
+    hardcap_version INT REFERENCES hardcap_profile(version),  -- 적용된 정책 버전
     created_at  TIMESTAMPTZ DEFAULT now()
 );
 
@@ -286,6 +362,19 @@ CREATE INDEX idx_obs_asof
 **개정(revision) 처리.** 유니크 제약이 3컬럼(`code, observation_date, release_date`)이라
 같은 관측월의 수정값이 **새 행으로 공존**한다. UPDATE로 덮어쓰면 개정 전에 보였던 값을
 영영 복원할 수 없다. append-only 라서 감사 추적이 그대로 남는다.
+
+**`clamps` 를 별도 테이블이 아니라 JSONB 컬럼으로 둔 이유.** (a) 항상 소속 Spec 과 함께
+읽히고 — `clamps` 만 따로 조회할 상황이 없다, (b) 항목 수가 캡 개수로 묶여 있고(현재 최대 4),
+(c) 한 번 쓰이면 불변이다. 테이블로 빼면 `/specs` 조회마다 JOIN 이 하나 늘 뿐 얻는 질의
+자유도가 없다. `indicator_observations` 를 테이블로 뺀 것과는 상황이 정반대다 — 그쪽은 행이
+독립적으로 계속 쌓이고 시점으로 조회되지만 `clamps` 는 둘 다 아니다. 바로 위 `indicators`
+컬럼과 같은 판단이다.
+
+**`hardcap_version` 만 별도 스칼라 컬럼인 이유.** `clamps` 만 있으면 나중에 해석이 안 된다
+("20 으로 잘렸다"는 알겠는데 그때 상한이 20 이었는지 알 수 없다). 그리고 "정책 v1 로
+만들어진 Spec 전부" 같은 질의가 실제로 필요한데, 그건 스칼라 컬럼이라야 인덱스가 먹는다.
+`requests.survey`(요청값) → `specs.clamps`(조정 내역) → `hardcap_profile`(정책 원본)
+셋을 이으면 조정 과정 전체가 복원된다.
 
 - ORM은 취향껏 (SQLAlchemy 또는 psycopg 직접). 데모 규모라 psycopg + 간단 쿼리로 충분.
 - 테이블 생성은 `db/schema.sql` (docker-entrypoint-initdb.d, **볼륨 최초 생성 시 1회**).
@@ -337,12 +426,13 @@ volumes: { pgdata: {} }
 │   ├── llm.py                # Ollama 호출 + 검증/재시도
 │   ├── db.py                 # Postgres 연결/저장/조회 (requests, specs)
 │   ├── indicators.py         # 경제지표 수집·적재·as-of 조회 (§17)
-│   └── validators.py         # 유니버스/레버리지 검증
+│   └── validators.py         # 2계층 유니버스/레버리지 + 4계층 하드캡 (§8, §18)
 ├── db/
 │   └── schema.sql            # 테이블 DDL (컨테이너 최초 기동 시 1회 실행)
 ├── data/
 │   ├── etf_universe.json
-│   └── economic_indicators.json   # 경제지표 seed (실제 통계 아님, §17)
+│   ├── economic_indicators.json   # 경제지표 seed (실제 통계 아님, §17)
+│   └── hardcap_profile.json       # 하드캡 v1 seed + 값별 근거 (전부 잠정치, §18)
 └── static/
     └── index.html
 ```
@@ -380,6 +470,44 @@ volumes: { pgdata: {} }
   지표는 Spec 생성의 의존성이 아니라 부가정보다.
 - 자동 검증: `docker compose exec api python -m app.indicators` — 위 성질을 assert 로 확인.
 
+**하드캡 시연 (§18)** — 이 시연의 핵심은 **"거부가 아니라 조정"** 이라는 점이다.
+사용자는 원하는 걸 받고(200), 시스템은 상한을 지키고, **무엇이 어떻게 바뀌었는지가
+사용자에게 그대로 보인다**. 조정 내역을 숨기면 값이 조용히 바뀐 것처럼 보여서
+"거부됐다"와 구분이 안 된다. 브라우저에서는 결과 Spec 위에 주황 배너로 뜬다.
+
+| # | 입력 | 기대 결과 |
+|---|---|---|
+| 1 | 설문 그대로 (`max_loss` 3/5/10) | **200, `clamps: []`.** 정상 요청은 하드캡에 걸리지 않는다 |
+| 2 | `max_loss: 25` (설문 밖 값, curl) | **200**, `spec.max_loss_pct = 20`, `clamps` 1건 |
+| 3 | `max_loss: 50` / `100` | 위와 동일하게 전부 **20 으로 수렴** (차단율 측정 대상) |
+| 4 | note 로 "동일 조건에 buy 와 sell 을 동시에" 유도 | **400** + `하드캡 구조적 위반: 동일 조건(...)에 buy 와 sell 이 동시에 지정됨` |
+
+```bash
+# ② 클램프 — 거부가 아니라 200 이라는 점이 핵심
+curl -s -X POST localhost:8000/compile -H 'Content-Type: application/json' \
+  -d '{"sector":"반도체","risk":"aggressive","max_loss":25,
+       "style":"추세추종(모멘텀)","rebalance":"monthly","note":"손실 25%까지 감수"}' \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["spec"]["max_loss_pct"],d["clamps"])'
+# → 20.0 [{'field': 'max_loss_pct', 'requested': 25.0, 'applied': 20.0, ...}]
+```
+
+**정책 버전 전환 시연** — 캡 값이 코드가 아니라 DB 에서 온다는 증거.
+새 버전을 INSERT 하면 **컨테이너 재시작 없이** 다음 요청부터 적용된다.
+
+```bash
+docker compose exec db psql -U demo -d demo -c \
+  "INSERT INTO hardcap_profile VALUES (2, 15, 30, 7, 40, '상한 15로 조정');"
+curl -s localhost:8000/health | python3 -c 'import sys,json;print(json.load(sys.stdin)["hardcap"])'
+# → ok (v2 / max_loss<=15% ...)   ← 재시작 안 했는데 바뀐다
+# 같은 요청을 다시 던지면 이번엔 15 로 클램프된다.
+```
+이전 버전은 **UPDATE 로 덮이지 않고 그대로 남는다.** 되돌릴 때도 DELETE 가 아니라
+원래 값으로 새 버전을 INSERT 한다 — 그래야 과거 Spec 의 `hardcap_version` 이 가리키는
+정책이 계속 복원 가능하다.
+
+- 자동 검증: `docker compose exec api python -m app.validators`
+  — 클램프·반려·스텁 판정 불가·프로파일 교체를 전부 assert 로 확인 (DB 없이 순수 함수로).
+
 ## 16. 확인 필요 사항 (Open Decisions)
 
 1. ~~**하드웨어**~~ → **확정**: MacBook M4 16GB 통합메모리, 모델 `qwen3:8b`.
@@ -390,6 +518,14 @@ volumes: { pgdata: {} }
    판정은 (a) 임계값에 근거가 없어 검증 불가, (b) 프롬프트에 국면 라벨이 들어가면
    `temperature=0` 이어도 as_of 에 따라 Spec 출력이 흔들려 §15 재현성 시나리오를
    재검증해야 하고, (c) 판단 계층 소속이라 이번 범위 밖 — 세 이유로 제외.
+6. **하드캡 값 (§18)** — **전부 팀 잠정 결정이며 개발 중 변경 가능.** 확정 절차 필요:
+   - `max_loss_pct_cap = 20` — 설문 최대 선택지(10)의 2배라는 것 외의 근거 없음
+   - `mdd_pct_cap = 30` — "1회 손실 한도 < MDD 상한" 관계만 근거. 절대값은 **P3 에서
+     유니버스 실측 MDD 확인 후 확정**
+   - `single_etf_weight_cap = 40` — 적용 자체가 불가(비중 필드 부재). **P3 배분 계층에서
+     스키마 확장과 함께 재검토**
+7. **3계층(논리)의 소속** — 현재 논리 모순 판정이 4계층 진입부에 붙어 있다.
+   판정 항목이 늘어나면 별도 계층으로 분리할지 결정 필요.
 
 ---
 
@@ -479,6 +615,135 @@ ECOS/FRED 응답에서 `release_date` 를 어떻게 얻느냐가 관건이다. �
 몇 번을 다시 떠도 중복이 쌓이지 않는다. 적재 실패는 삼킨다 — 지표가 없어도 `/compile` 은
 돌아가야 하므로 서버 기동 자체를 막을 이유가 없다. 상태는 `/health` 의 `indicators` 에 뜬다
 (`ok (5종 / 관측치 16건)` / `empty: 지표 미적재` / `error: ...`).
+
+---
+
+## 18. 시스템 하드캡 — Validator 4계층
+
+기획서 4.1 Validator 4계층의 **4번째 계층**. 원칙 한 줄:
+
+> **수치는 클램프, 구조적 위반은 반려.**
+
+### 18.1 하드캡 값과 근거
+
+> ⚠️ **아래 값은 전부 팀 잠정 결정(2026-08-28)이며 개발 중 변경 가능하다.**
+> 코드에 상수로 박혀 있지 않고 `hardcap_profile` 테이블 → `data/hardcap_profile.json` seed
+> 에만 있다. 값을 바꾸려면 새 버전을 INSERT 한다 (§18.3).
+
+| 항목 | 초기값 | 근거 | 확정 여부 | 데모 동작 |
+|---|---|---|---|---|
+| **1회 손실 한도** `max_loss_pct_cap` | **20%** | 설문 선택지 최대값(10%)의 **2배**. 정상 요청(3/5/10)은 안 걸리고 적대적 입력(30·50·100)만 걸리게 해서 "하드캡 차단율" 지표가 정상 요청에 희석되지 않게 한다. **하한은 두지 않는다** — 낮게 잡는 건 보수적 선택이라 막을 이유가 없다 | **잠정** | ✅ **실제 발동 (클램프)** |
+| **MDD 상한** `mdd_pct_cap` | **30%** | `1회 손실 한도(20) < MDD 상한(30)` 관계 유지, 그것 하나가 유일한 근거. 절대값은 **P3 에서 유니버스 실측 MDD 확인 후 확정** | **잠정 (절대값 근거 없음)** | ⛔ 스텁 — 백테스트 계층이 없어 **판정 불가** |
+| **최소 리밸런싱 간격** `min_rebalance_days` | **7일** | 현행 `RebalanceFreq` 최소 단위 `weekly`(7일)와 **일부러 같게** 잡았다. 더 크게 잡으면 설문의 '주 1회' 선택지가 **항상** 클램프돼 정상 응답이 매번 조정된다 | **잠정** | ⛔ 미발동 — 로직은 살아 있고, enum 에 더 짧은 주기가 추가되거나 캡을 8↑ 로 올리면 즉시 발동 |
+| **단일종목 상한** `single_etf_weight_cap` | **40%** | 적용 자체가 불가능해 값에 실질적 근거가 없다 | **잠정 (적용 불가)** | ⛔ 스텁 — **`StrategySpec` 에 종목별 비중 필드가 없어 판정 불가** |
+
+**단일종목 상한의 미적용 사유를 정확히 해 둔다.** 사유는 **"종목별 비중 필드 부재"** 하나다.
+"ETF 라서 이미 분산돼 있으니 불필요"가 **아니다.** ETF 내부 분산과 포트폴리오 내 ETF 비중은
+별개 문제다 — `KODEX 반도체` 하나에 100% 를 배분하면 그 ETF 가 내부적으로 수십 종목에
+분산돼 있어도 포트폴리오는 반도체 섹터에 100% 노출된다. 이 캡이 막으려는 섹터 집중 위험은
+실재하며, 지금 스키마로 표현할 수 없을 뿐이다. **P3 배분 계층에서 스키마 확장과 함께 재검토.**
+
+**스텁은 조용히 통과시키지 않는다.** 세 항목 모두 호출하면 `status: "undecidable"` 과
+사유를 돌려준다. `ok`(검사했고 통과)를 돌려주면 캡이 작동 중인 것처럼 보이는데, 그게
+값이 없는 것보다 위험하다. `/health` 의 `hardcap` 과 `hardcap_report()` 에서 확인할 수 있다.
+
+### 18.2 하드캡 값을 LLM 프롬프트에 넣지 않는 이유
+
+**`app/prompt.py` 는 하드캡을 전혀 모른다. 앞으로도 그래야 한다.**
+
+LLM 은 상한의 존재도 값도 모르는 채로 Spec 을 생성하고, 서버가 **사후에** 깎는다.
+값을 알려주면 모델이 경계에 맞춰(19.9 같은 값으로) 생성하기 시작해서 클램프 이벤트가
+아예 발생하지 않고, 향후 측정할 **"적대적 입력에 대한 하드캡 차단율"이 0 으로 수렴해
+지표가 무의미**해진다. 차단율 측정은 LLM 이 하드캡을 모른다는 전제 위에 서 있다.
+
+여기서 파생되는 구조적 제약이 하나 있다:
+
+> **하드캡은 `llm.py` 의 재시도 루프 밖에서 적용해야 한다.**
+> `llm.py` 는 검증 실패 사유를 `build_user(retry_reason=...)` 로 **프롬프트에 덧붙여**
+> 재시도한다. 하드캡 위반을 그 경로로 흘리면 `"max_loss_pct 상한 20 초과"` 같은 문자열이
+> 그대로 모델에게 전달된다 — 우회로로 값이 새는 것이다.
+> 그래서 `enforce_hardcaps()` 호출은 `compile_spec()` **밖**, `main.py` 에 있다.
+
+### 18.3 `hardcap_profile` — 값은 코드가 아니라 DB 에서
+
+**왜 코드 상수가 아닌가.** 하드캡은 운영 중 조정되는 정책값이다. 코드에 박으면 값을 바꿀
+때마다 배포가 필요하고, "언제 무슨 값이었는지"가 git log 에만 남아 Spec 행과 대조가 안 된다.
+
+**왜 UPDATE 가 아니라 새 버전 INSERT 인가.** 덮어쓰면 과거 Spec 에 적용됐던 캡을 영영
+복원할 수 없다. `indicator_observations` 가 개정을 새 행으로 쌓는 것과 같은 발상(§17).
+
+**활성 버전 = `MAX(version)`.** 검토한 대안과 탈락 이유:
+
+| 방식 | 판단 |
+|---|---|
+| `is_active BOOLEAN` | ❌ 새 버전을 켜려면 **이전 행을 UPDATE** 해서 꺼야 한다 — 이 테이블이 금지하는 바로 그 변경이다. 게다가 활성 행이 0개나 2개인 불법 상태를 스키마가 못 막는다 |
+| `effective_from` as-of 조회 (§17 방식) | ❌ 예약 적용은 가능해지지만, 하드캡은 *관측된 데이터*가 아니라 *요청 시점에 적용되는 정책*이라 발표 지연 개념이 없다. 적용된 정책은 `specs.hardcap_version` 에 이미 박제되므로 사후 감사에 as-of 조회가 불필요 |
+| **`MAX(version)`** | ✅ **채택.** 활성 여부가 데이터에서 파생돼 따로 관리할 상태가 없고 불일치가 원천적으로 불가능하다. `INSERT ... version = 2` 한 줄이 곧 전환 |
+
+**재시작 없이 반영되는 이유.** `llm.py` 의 `_UNIVERSE` 와 달리 모듈 로드 시 캐시하지 않고
+**요청마다 조회**한다. 30~60초짜리 LLM 호출 옆에서 단일 행 SELECT 하나는 무시할 수 있다.
+
+**적재.** lifespan 이 `seed_hardcap_profile()` 을 1회 호출한다. 지표 메타(`DO UPDATE`)와 달리
+**`ON CONFLICT (version) DO NOTHING`** 이다 — 이미 적재된 버전을 seed 파일 수정으로 바꿀 수
+있으면 그 버전으로 만들어진 과거 Spec 의 근거가 조용히 달라진다. 값을 바꾸려면 seed 에
+새 `version` 을 추가해야 한다 (= 추가만 가능한 원장).
+
+### 18.4 계층 구현 (`app/validators.py`)
+
+**이 파일에는 캡 값이 하나도 없다.** 전부 `profile` 인자로 들어오고, 파일은 DB 도
+import 하지 않는다. 그래서 (a) "값을 코드에 하드코딩하지 않는다"가 구조로 보장되고
+(어떤 함수도 인자 없이는 캡 값을 알 수 없다), (b) 셀프체크가 DB 없이 순수 함수로 돈다.
+
+```python
+def enforce_hardcaps(spec: dict, profile: dict) -> tuple[dict, list[dict]]:
+    problems = find_logical_contradictions(spec)   # ① 구조적 위반이면 먼저 반려
+    if problems:
+        raise ValueError(" / ".join(problems))     #    → main.py 가 400 으로 변환
+
+    clamped, clamps = dict(spec), []               # ② 수치는 깎아서 살린다
+    for check in (check_max_loss_pct, check_min_rebalance_interval):
+        verdict = check(clamped, profile)
+        if verdict["status"] == "clamped":
+            clamped[verdict["field"]] = verdict["applied"]
+            clamps.append({...})                   #    조정 내역을 남긴다 (200 으로 응답)
+    return clamped, clamps
+```
+
+판정 상태는 셋이고, **"조용히 통과"가 없다**:
+`ok`(검사 후 위반 없음) / `clamped`(조정함) / `undecidable`(**판정 불가 — 통과가 아니다**).
+
+**구조적 위반 (반려) 판정 항목**
+
+| 검사 | 발동 |
+|---|---|
+| `signals` 가 비어 있음 — 매매 조건 없는 Spec 은 실행 불가 | ✅ |
+| 동일 조건(`indicator`·`operator`·`threshold` 셋 다 같음)에 buy 와 sell 동시 지정 | ✅ 데모에서 실제 발동 |
+| 안정형(`conservative`)인데 레버리지 종목 지정 | ⛔ **현행 파이프라인으로는 도달 불가** |
+
+> 마지막 항목의 한계 — 이유가 둘 겹쳐 있다: (a) `data/etf_universe.json` 에 레버리지/인버스
+> 종목이 아예 없고, (b) 설령 있어도 **2계층 `validate_etfs()` 가 하드캡보다 먼저 돌아 반려**한다.
+> 그래도 남겨 둔 이유: 유니버스가 KRX 전체로 확장되고 레버리지가 '성향 무관 허용'으로
+> 바뀌는 순간 이 검사만이 "안정형인데 레버리지"를 잡는다. 코드 주석에도 같은 내용이 있다.
+
+**같은 `indicator` 에 buy/sell 이 함께 있는 것 자체는 모순이 아니다** —
+`momentum_20d > 0 → buy` / `momentum_20d < 0 → sell` 은 평범한 추세추종 전략이다.
+모순은 `indicator`·`operator`·`threshold` 가 **셋 다 같은데 action 만 반대**일 때, 즉
+조건이 참인 순간 buy 와 sell 이 동시에 성립할 때다. 이 구분을 놓치면 정상 전략이
+전부 반려된다 (셀프체크에 두 경우가 모두 들어 있다).
+
+### 18.5 실패 처리 — fail closed
+
+하드캡 프로파일을 못 읽으면 `/compile` 은 **503** 이다. 지표(§17)가 실패해도 `{}` 로
+넘어가 200 을 내는 것과 **의도적으로 반대**다:
+
+| 계층 | 못 읽었을 때 | 왜 |
+|---|---|---|
+| 경제지표 (§17) | `{}` 로 넘어가고 **200** | 부가정보다. Spec 생성의 의존성이 아니다 |
+| 하드캡 (§18) | **503** (fail closed) | 안전 계층이다. 조용히 사라진 채로 Spec 을 내보내는 게 에러보다 나쁘다 |
+
+`/health` 의 `hardcap` 에 활성 버전과 캡 값이 그대로 찍힌다:
+`ok (v1 / max_loss<=20% mdd<=30% rebalance>=7d single_etf<=40%)`.
+지표와 달리 `empty` 라는 정상 상태가 없다 — 프로파일이 없으면 그건 `error` 다.
 
 ---
 

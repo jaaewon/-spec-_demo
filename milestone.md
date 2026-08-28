@@ -106,7 +106,52 @@
 
 ---
 
+## M8. 시스템 하드캡 — Validator 4계층 (M7 이후 추가)
+
+기획서 4.1 Validator 4계층 중 **4번째 계층**. CLAUDE.md §2 에서 "제외"였던 항목을
+구현 범위로 승격. 규약은 CLAUDE.md §18.
+
+원칙 한 줄: **수치는 클램프(200), 구조적 위반은 반려(400).** 전부 400 으로 막지 않는다.
+
+**할 일**
+- `db/schema.sql`: `hardcap_profile` 테이블(버전 컬럼, **활성 버전 = MAX(version)**).
+  `specs` 에 `clamps JSONB` / `hardcap_version INT` 2컬럼 추가
+- `data/hardcap_profile.json`: v1 seed 4항목 + 값별 근거. **전부 팀 잠정치**
+- `app/db.py`: `seed_hardcap_profile()`(멱등, `ON CONFLICT DO NOTHING`) /
+  `load_active_hardcap_profile()`(**요청마다 조회 — 캐시 금지**) / `hardcap_status()`
+- `app/validators.py`: 기존 참조 계층 **무수정**, 4계층 섹션 추가.
+  `enforce_hardcaps()` / `find_logical_contradictions()` / 항목별 체크 4종.
+  **캡 값은 인자로만 받는다** (이 파일은 DB 를 import 하지 않는다)
+- `app/main.py`: lifespan seed, `/compile` 에 4계층 적용 + `clamps` 응답,
+  `/health` 에 하드캡 상태
+- `static/index.html`: 조정 내역 배너 (거부와 시각적으로 구분)
+
+**하지 말 것 (제약)**
+- `app/prompt.py` 수정 금지 — 하드캡 값이 프롬프트에 들어가면 모델이 경계에 맞춰
+  생성해 클램프가 안 일어나고, "적대적 입력 차단율" 지표가 무의미해진다 (§18.2)
+- 같은 이유로 `enforce_hardcaps()` 를 `llm.py` 재시도 루프 **안**에 넣지 말 것 —
+  재시도는 실패 사유를 프롬프트에 덧붙이므로 그 경로로 값이 샌다
+- `StrategySpec` 기존 필드 변경 금지 / 새 라이브러리 추가 금지
+
+**완료 기준**
+- `python -m app.validators` — 클램프·반려·스텁 판정 불가·프로파일 교체 assert 통과
+- `max_loss: 25` → **200**, `spec.max_loss_pct = 20`, `clamps` 에 조정 내역
+  (필드명·요청값·조정값·사유)
+- 구조적 위반(동일 조건 buy/sell 동시) → **400** + 사유
+- `hardcap_profile` 에 v2 INSERT → **컨테이너 재시작 없이** 다음 요청부터 새 값 적용
+- 설문 선택지(3/5/10)는 전부 `clamps: []` — 정상 요청은 하드캡에 안 걸린다
+- 스텁 3종은 값은 있되 호출 시 `undecidable` + 사유 반환 (조용히 통과 금지)
+- 회귀: `GET /indicators` `/specs` `/health` 기존과 동일
+
+**범위 밖으로 남긴 것 (스텁 3종)** — 사유는 CLAUDE.md §2 표와 §18.1 참고.
+MDD(백테스트 계층 부재) · 최소 리밸런싱 간격(현행 enum 최소 단위가 캡과 동일해 미발동) ·
+단일종목 상한(**종목별 비중 필드 부재** — ETF 라서 불필요한 게 아니다). 뒤 둘은 P3 재검토.
+
+---
+
 ## 범위 밖 (이번 데모에서 안 함)
 
-하드캡 조건문 · RAG · 백테스팅 · 승인 게이트 · 다중턴 되묻기. — CLAUDE.md §2 제외 항목 그대로.
-(경제지표 DB 는 M7 로 범위에 편입됨 — 단, **조회 계층까지만**이고 소비/실 API 연동은 여전히 범위 밖)
+RAG · 백테스팅 · 승인 게이트 · 다중턴 되묻기. — CLAUDE.md §2 제외 항목 그대로.
+- 경제지표 DB 는 M7 로 편입 — 단 **조회 계층까지만**, 소비/실 API 연동은 여전히 범위 밖.
+- 하드캡은 M8 로 편입 — 단 **실제 발동은 `max_loss_pct` 클램프와 논리 모순 반려까지**.
+  MDD·최소간격·단일종목은 값만 저장하는 스텁이다.
