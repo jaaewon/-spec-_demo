@@ -5,23 +5,29 @@
       → SurveyRequest 로 입력 검증        (schemas.py)
       → 프롬프트 문자열 조립               (prompt.py)
       → requests 테이블에 원문 저장        (db.py)
-      → Ollama 호출 + Spec 검증            (llm.py → validators.py)
+      → Ollama 호출 + 스키마·참조 검증      (llm.py → validators.py)  ← 1~2계층, 재시도 있음
+      → 하드캡 적용: 클램프 or 반려         (validators.py)           ← 4계층, 재시도 없음
+      → snapshot_date 기준 경제지표 as-of 조회 (indicators.py) — 실패해도 무시
       → specs 테이블에 결과 저장           (db.py)
-      → Spec JSON 응답
+      → Spec JSON + 조정 내역 응답
 """
 
 import os
-from functools import lru_cache
+from contextlib import asynccontextmanager
+from datetime import date
 
 import ollama
 import psycopg
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response
 
-from app.db import get_spec, list_specs, save_request, save_spec
+from app.db import (hardcap_status, list_specs, load_active_hardcap_profile,
+                    save_request, save_spec, seed_hardcap_profile, get_spec)
+from app.indicators import get_indicators_as_of, indicators_status, seed_indicators
 from app.llm import compile_spec
 from app.prompt import build_user
 from app.schemas import StrategySpec, SurveyRequest
+from app.validators import enforce_hardcaps
 
 # 설정은 전부 환경변수로 (docker-compose.yml 의 environment 참고).
 # os.environ[...] 은 없으면 즉시 KeyError → 설정 누락을 기동 시점에 바로 알 수 있다.
@@ -30,7 +36,32 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 OLLAMA_HOST = os.environ["OLLAMA_HOST"]
 OLLAMA_MODEL = os.environ["OLLAMA_MODEL"]
 
-app = FastAPI(title="Strategy Spec Compiler (demo)")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """기동 시 경제지표 seed 와 하드캡 프로파일을 1회 적재한다.
+
+    별도 마이그레이션 도구를 안 쓰는 이유: 테이블 생성은 db/schema.sql 이
+    (볼륨 최초 생성 시) 맡고, 데이터 적재만 여기서 한다. 두 seed 함수 모두
+    멱등이라 --reload 로 몇 번을 다시 떠도 중복이 쌓이지 않는다.
+
+    적재 실패는 둘 다 삼킨다. 다만 이유가 다르다:
+      - 지표: 없어도 /compile 이 정상 동작한다 (부가정보).
+      - 하드캡: 없으면 /compile 이 503 이다. 그래도 여기서 예외를 터뜨려 서버 기동을
+        막지는 않는다 — 그러면 원인이 컨테이너 로그에만 남고 /health 로 확인할 수가 없다.
+        기동은 시키고 상태를 /health 에 드러내는 편이 진단이 빠르다.
+    """
+    try:
+        print(f"[startup] 지표 seed 적재: {seed_indicators()}")
+    except Exception as e:
+        print(f"[startup] 지표 seed 적재 실패 (무시하고 계속): {e}")
+    try:
+        print(f"[startup] 하드캡 프로파일 적재: {seed_hardcap_profile()}")
+    except Exception as e:
+        print(f"[startup] 하드캡 프로파일 적재 실패 (/compile 이 503 이 된다): {e}")
+    yield
+
+
+app = FastAPI(title="Strategy Spec Compiler (demo)", lifespan=lifespan)
 
 
 @app.get("/")
@@ -59,6 +90,7 @@ def compile_(survey: SurveyRequest):
     # (specs 행이 없는 requests 행 = 실패한 시도)
     request_id = save_request(payload, nl_text)
 
+    # ── 1~2계층: 스키마 + 참조(유니버스/레버리지). 실패 시 llm.py 안에서 1회 재시도한다.
     try:
         spec = compile_spec(payload)
     except ValueError as e:
@@ -68,11 +100,56 @@ def compile_(survey: SurveyRequest):
         # Ollama 미기동, 타임아웃 등 → 서버 사정이므로 503
         raise HTTPException(status_code=503, detail=f"LLM 호출 실패: {e}")
 
+    # ── 4계층: 하드캡 (CLAUDE.md §18).
+    #
+    # 반드시 compile_spec **밖**에서 한다. llm.py 의 재시도는 실패 사유를 프롬프트에
+    # 덧붙이는 방식이라, 하드캡 위반을 그 경로로 흘리면 상한값이 LLM 에게 새어 나간다.
+    # 그러면 모델이 경계에 맞춰 생성해 클램프가 발생하지 않고, 나중에 측정할
+    # "적대적 입력에 대한 하드캡 차단율"이 무의미해진다. LLM 은 하드캡을 모르는 채로
+    # 만들고, 서버가 사후에 깎는다.
+    try:
+        profile = load_active_hardcap_profile()
+    except Exception as e:
+        # 지표(_as_of_snapshot)와 달리 여기서 조용히 넘어가지 않는다.
+        # 하드캡은 부가정보가 아니라 안전 계층이라, 없는 채로 Spec 을 내보내는 게
+        # 에러보다 나쁘다 (fail closed).
+        raise HTTPException(
+            status_code=503,
+            detail=f"하드캡 프로파일을 읽을 수 없어 Spec 을 낼 수 없습니다: {e}")
+
+    try:
+        spec_json, clamps = enforce_hardcaps(spec.model_dump(mode="json"), profile)
+    except ValueError as e:
+        # 구조적 위반만 여기로 온다. 수치 초과는 예외가 아니라 clamps 로 나간다.
+        raise HTTPException(status_code=400, detail=f"하드캡 구조적 위반: {e}")
+
+    # 클램프한 결과를 1계층으로 되돌려 확인한다. 조정 로직이 스키마를 깨뜨리면
+    # (예: 캡이 음수로 잘못 들어가 max_loss_pct 가 ge=0 을 위반) 저장 전에 잡힌다.
+    spec = StrategySpec.model_validate(spec_json)
     spec_json = spec.model_dump(mode="json")
-    spec_id = save_spec(request_id, spec_json, OLLAMA_MODEL)  # 어떤 모델이 만들었는지도 함께 박제
-    # spec_id 를 돌려주는 이유: 프론트가 바로 POST /backtest/{spec_id} 를 호출할 수 있어야 한다.
-    # (기존 키는 그대로 두므로 이 응답을 쓰던 쪽은 영향 없다)
-    return {"request_id": request_id, "spec_id": spec_id, "spec": spec_json}
+
+    # Spec 의 snapshot_date 를 그대로 as-of 키로 써서 "그 시점에 보였던 지표"를 뜬다.
+    # 이 값은 프롬프트에 들어가지 않는다 — LLM 출력에 영향을 주지 않으므로
+    # 기존 시연 시나리오(§15)의 재현성이 그대로 유지된다. 기록·조회 계층일 뿐이다.
+    indicators = _as_of_snapshot(spec.snapshot_date)
+
+    # 모델·지표 스냅샷·조정 내역·정책 버전을 함께 박제
+    save_spec(request_id, spec_json, OLLAMA_MODEL, indicators, clamps, profile["version"])
+    return {"request_id": request_id, "spec": spec_json,
+            "indicators": indicators, "clamps": clamps}
+
+
+def _as_of_snapshot(as_of: date) -> dict:
+    """지표 조회. **어떤 이유로 실패하든 {} 를 돌려준다.**
+
+    지표 테이블이 비어 있거나(아직 seed 전), 아예 없거나(구 볼륨), DB 가 흔들려도
+    /compile 은 200 이어야 한다. 지표는 Spec 생성의 의존성이 아니라 부가정보다.
+    """
+    try:
+        return get_indicators_as_of(as_of)
+    except Exception as e:
+        print(f"[compile] 지표 조회 실패 (무시): {e}")
+        return {}
 
 
 @app.get("/specs")
@@ -85,69 +162,33 @@ def specs(limit: int = 20):
     return list_specs(min(limit, 100))
 
 
-@app.post("/backtest/{spec_id}")
-def backtest_(spec_id: int, years: int | None = None):
-    """저장된 Spec 을 vectorbt 로 백테스트하고 리포트를 반환.
+@app.get("/indicators")
+def indicators(as_of: date | None = None):
+    """as_of 시점에 **공개돼 있던** 최신 지표들. as_of 생략 시 오늘.
 
-    초기 자본 1천만원, 기본 구간은 오늘로부터 5년 (app/backtest.py 의 상수).
-    한 번에 수 초~수십 초 걸린다 (pykrx 시세 조회 + 최초 호출 시 numba 컴파일).
+    타입을 date 로 선언했으므로 FastAPI 가 YYYY-MM-DD 파싱까지 해준다
+    (형식이 틀리면 이 함수는 호출되지 않고 422). 미래 날짜는 막지 않는다 —
+    seed 의 미래 관측치를 미리 볼 수 있는 게 아니라, 그냥 전부 공개된 상태로 보일 뿐이라
+    as-of 규칙 자체는 깨지지 않는다.
     """
-    row = get_spec(spec_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"Spec 없음: id={spec_id}")
-
-    # 지연 임포트: vectorbt/pandas 는 무겁다. 백테스트를 안 쓰는 사람이 /compile 만
-    # 쓸 때 앱 기동이 느려지지 않도록 여기서 들여온다.
-    from app.backtest import DEFAULT_YEARS, format_report, run_backtest
-
-    spec = StrategySpec.model_validate(row["spec"])
-    try:
-        # years 는 쿼리스트링이라 사용자가 조작할 수 있다. 상한을 걸어
-        # years=9999 로 KRX 를 통째로 긁는 요청을 막는다.
-        result = run_backtest(spec, years=min(years or DEFAULT_YEARS, 10))
-    except ValueError as e:
-        # 티커 매핑 누락 / 지원하지 않는 지표 → Spec 쪽 문제
-        raise HTTPException(status_code=400, detail=f"백테스트 불가: {e}")
-    except Exception as e:
-        # pykrx 조회 실패 등 외부 사정
-        raise HTTPException(status_code=503, detail=f"시세 조회 실패: {e}")
-
-    return {
-        "spec_id": spec_id,
-        "spec": row["spec"],
-        "metrics": result.metrics(),
-        "report": format_report(result),   # 사람이 읽는 텍스트 리포트
-        "chart": result.chart,             # plotly figure (프론트가 Plotly.newPlot 으로 그린다)
-    }
-
-
-@lru_cache(maxsize=1)
-def _plotly_js() -> str:
-    """plotly.js 번들 원문 (약 4.5MB). 매 요청마다 파일을 읽지 않도록 캐시한다."""
-    from plotly.offline import get_plotlyjs
-
-    return get_plotlyjs()
-
-
-@app.get("/plotly.js")
-def plotly_js():
-    """차트 라이브러리를 직접 서빙한다.
-
-    CDN 을 쓰지 않는 이유: 네트워크가 막힌 곳에서 시연하면 차트만 빈 칸이 된다.
-    plotly 는 vectorbt 의 의존성이라 컨테이너 안에 이미 들어 있으므로 그대로 내보낸다.
-    immutable 캐시라 브라우저는 최초 1회만 받는다.
-    """
-    return Response(
-        _plotly_js(),
-        media_type="application/javascript",
-        headers={"Cache-Control": "public, max-age=31536000, immutable"},
-    )
+    as_of = as_of or date.today()
+    return {"as_of": as_of.isoformat(), "indicators": get_indicators_as_of(as_of)}
 
 
 @app.get("/health")
 def health():
     """DB·Ollama 가 모두 살아 있는지 한 번에 확인. 기동 직후 제일 먼저 찔러볼 곳."""
-    return {"db": _db_status(), "ollama": _ollama_status(), "model": OLLAMA_MODEL}
+    return {
+        "db": _db_status(),
+        "ollama": _ollama_status(),
+        "model": OLLAMA_MODEL,
+        # 지표는 "없어도 되는" 계층이라 error 대신 empty 라는 상태가 따로 있다.
+        # empty 여도 /compile 은 정상 동작한다.
+        "indicators": indicators_status(),
+        # 하드캡은 반대로 '없어도 되는' 상태가 없다 — 못 읽으면 /compile 이 503.
+        # 활성 버전과 캡 값이 그대로 찍히므로 "지금 어떤 정책이 걸려 있나"를 여기서 본다.
+        "hardcap": hardcap_status(),
+    }
 
 
 def _db_status() -> str:

@@ -20,6 +20,14 @@
   .err { color: #dc2626; white-space: pre-wrap; }
   #chart { margin: 0 0 1rem; }
   #chart:empty { display: none; }
+  /* 하드캡 조정 안내. 거부(.err 빨강)와 시각적으로 확실히 구분해야 한다 —
+     조정은 실패가 아니라 성공한 요청이기 때문. 그래서 경고색(주황)이지 에러색이 아니다. */
+  #clamps { display: none; border: 1px solid #f59e0b; background: #f59e0b1a;
+            border-radius: 8px; padding: .75rem 1rem; margin-bottom: 1rem; }
+  #clamps h3 { margin: 0 0 .5rem; font-size: .95rem; }
+  #clamps ul { margin: 0; padding-left: 1.2rem; }
+  #clamps li { margin: .25rem 0; font-size: .9rem; }
+  #clamps code { font-weight: 600; }
 </style>
 </head>
 <body>
@@ -75,6 +83,7 @@
 </form>
 
 <h2>결과 Spec</h2>
+<div id="clamps"></div>
 <pre id="out">설문을 제출하세요.</pre>
 
 <h2>백테스트 리포트</h2>
@@ -87,6 +96,7 @@ const btn = document.getElementById('go');
 const out = document.getElementById('out');
 const bt = document.getElementById('bt');
 const chart = document.getElementById('chart');
+const clampBox = document.getElementById('clamps');
 
 // 경과 초를 찍어 주는 진행 표시. 컴파일도 백테스트도 수 초~수십 초 걸려
 // 표시가 없으면 멈춘 걸로 보인다. 반환값을 clearInterval 로 꺼야 한다.
@@ -154,6 +164,20 @@ async function runBacktest(specId) {
   }
 }
 
+// 하드캡 조정 내역 렌더 (CLAUDE.md §18).
+// 이걸 보여주는 게 핵심이다 — 사용자 입장에서 "요청이 거부됐다"와
+// "요청이 통과했는데 일부가 조정됐다"는 완전히 다른 사건인데,
+// 조정 내역을 숨기면 둘을 구분할 수 없고 값이 조용히 바뀐 것처럼 보인다.
+function renderClamps(clamps) {
+  if (!clamps || clamps.length === 0) { clampBox.style.display = 'none'; return; }
+  clampBox.innerHTML =
+    `<h3>⚠ 시스템 하드캡에 의해 ${clamps.length}개 항목이 조정되었습니다 (요청은 정상 처리됨)</h3><ul>` +
+    clamps.map(c =>
+      `<li><code>${c.field}</code>: ${c.requested} → <strong>${c.applied}</strong><br>${c.reason}</li>`
+    ).join('') + '</ul>';
+  clampBox.style.display = 'block';
+}
+
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const body = Object.fromEntries(new FormData(form));
@@ -165,6 +189,7 @@ form.addEventListener('submit', async (e) => {
   bt.textContent = 'Spec 생성 대기 중...';   // 이전 실행 결과를 지운다
   if (window.Plotly) Plotly.purge(chart);   // 이전 차트 정리
   chart.innerHTML = '';
+  renderClamps([]);   // 이전 요청의 조정 내역이 남아 오해를 만들지 않도록 먼저 지운다
   // 로컬 8B라 30~60초 걸린다. 진행 표시가 없으면 멈춘 걸로 보임.
   const tick = progress(out, '컴파일 중');
 
@@ -181,6 +206,7 @@ form.addEventListener('submit', async (e) => {
       out.textContent = `${res.status} 거부됨\n\n` + JSON.stringify(data.detail, null, 2);
       bt.textContent = 'Spec 이 생성되지 않아 백테스트를 건너뜁니다.';
     } else {
+      renderClamps(data.clamps);
       out.textContent = JSON.stringify(data.spec, null, 2);
       await runBacktest(data.spec_id);   // Spec 이 나왔으면 이어서 백테스트
     }
