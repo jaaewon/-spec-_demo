@@ -75,6 +75,38 @@
 
 ---
 
+---
+
+## M7. 경제지표 피처 저장소 — as-of 조회 (M1~M5 이후 추가)
+
+상위 기획서 P1 "피처 저장소" 마일스톤의 선행 PoC. **입증 대상은 프롬프트 보강이 아니라
+시점 정합적 데이터 접근(as-of)** 이다. 자세한 규약은 CLAUDE.md §17.
+
+**할 일**
+- `db/schema.sql`: `indicators`(메타) / `indicator_observations`(관측치) 분리.
+  유니크 `(indicator_code, observation_date, release_date)` — 개정을 새 행으로 쌓기 위함.
+  `specs.indicators JSONB` 컬럼 추가 (as-of 스냅샷 박제)
+- `data/economic_indicators.json`: 지표 5종 seed (기준금리·환율·국고채3년·CPI·FFR).
+  **실제 통계 아님**, 출처 표기 필수. CPI 는 발표 지연(+약 1개월) 사례로 반드시 포함
+- `app/indicators.py`: `fetch_indicator_data()`(← **교체 지점**, 지금은 seed JSON) /
+  `seed_indicators()`(멱등) / `get_indicators_as_of(as_of, codes)` / `indicators_status()`
+- `app/main.py`: lifespan 에서 seed 1회 적재, `GET /indicators?as_of=`,
+  `/health` 에 지표 상태, `/compile` 이 `spec.snapshot_date` 로 조회해 응답·저장
+
+**완료 기준**
+- `docker compose down -v && up` → 테이블 생성 + seed 자동 적재, `/health` 에 `ok (5종 / 관측치 16건)`
+- `as_of=2026-08-03` → 2026-07 CPI 안 나옴 / `as_of=2026-08-04` → 나옴 (미래 정보 차단)
+- `as_of=2026-08-20` → 2.3 / `as_of=2026-08-21` → 2.4, 관측월은 둘 다 2026-07 (개정 이력 보존)
+- 지표 테이블을 통째로 비워도 `POST /compile` 이 200 (`indicators: {}`)
+- `docker compose exec api python -m app.indicators` — 위 성질 assert 통과
+
+**범위 밖으로 남긴 것**: 실제 ECOS/FRED 호출, 프롬프트 주입, 임계값 기반 시장온도 판정
+(판단 계층 소속). 판정 임계값은 근거가 없어 검증 불가이고, 국면 라벨이 프롬프트에 들어가면
+`temperature=0` 이어도 as_of 에 따라 Spec 이 흔들려 M5 시나리오를 재검증해야 한다.
+
+---
+
 ## 범위 밖 (이번 데모에서 안 함)
 
-하드캡 조건문 · RAG · 경제지표 DB · 백테스팅 · 승인 게이트 · 다중턴 되묻기. — CLAUDE.md §2 제외 항목 그대로.
+하드캡 조건문 · RAG · 백테스팅 · 승인 게이트 · 다중턴 되묻기. — CLAUDE.md §2 제외 항목 그대로.
+(경제지표 DB 는 M7 로 범위에 편입됨 — 단, **조회 계층까지만**이고 소비/실 API 연동은 여전히 범위 밖)

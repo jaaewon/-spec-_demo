@@ -4,8 +4,12 @@
 "어떤 입력이 어떤 Spec 이 됐는가"를 나중에 추적할 수 있어야 하기 때문에
 테이블을 requests / specs 둘로 나누고 FK 로 연결한다. (스키마는 db/schema.sql)
 
-ORM(SQLAlchemy) 을 안 쓰는 이유: 테이블 2개, 쿼리 3개짜리 데모라
+ORM(SQLAlchemy) 을 안 쓰는 이유: 테이블 몇 개, 쿼리 몇 개짜리 데모라
 ORM 을 얹으면 코드가 오히려 늘어난다. psycopg 로 직접 쓴다.
+
+경제지표 테이블(indicators / indicator_observations) 관련 쿼리는 여기가 아니라
+app/indicators.py 에 모아 뒀다. 나중에 실제 API 어댑터로 바꿀 때 그 파일 하나만 보면
+되도록 하기 위해서다. 연결 생성(_connect)만 이 파일에서 가져다 쓴다.
 """
 
 import os
@@ -48,12 +52,18 @@ def save_request(survey: dict, nl_text: str) -> int:
         return row["id"]
 
 
-def save_spec(request_id: int, spec: dict, model: str) -> int:
-    """생성된 Spec 저장. 어떤 요청(request_id)에서, 어떤 모델로 나왔는지 함께 기록."""
+def save_spec(request_id: int, spec: dict, model: str, indicators: dict | None = None) -> int:
+    """생성된 Spec 저장. 어떤 요청(request_id)에서, 어떤 모델로 나왔는지 함께 기록.
+
+    indicators : spec.snapshot_date 기준 as-of 로 조회된 경제지표 스냅샷 (CLAUDE.md §17).
+                 "이 Spec 이 만들어질 때 보였던 세계"를 version/model 과 같이 박제한다.
+                 지표를 못 읽었으면 None → {} 로 저장된다 (지표는 선택적 부가정보이지 의존성이 아니다).
+    """
     with _connect() as conn:
         row = conn.execute(
-            "INSERT INTO specs (request_id, spec, version, model) VALUES (%s, %s, %s, %s) RETURNING id",
-            (request_id, Json(spec), spec.get("version", 1), model),
+            """INSERT INTO specs (request_id, spec, version, model, indicators)
+               VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+            (request_id, Json(spec), spec.get("version", 1), model, Json(indicators or {})),
         ).fetchone()
         return row["id"]
 
@@ -66,7 +76,7 @@ def list_specs(limit: int = 20) -> list[dict]:
     """
     with _connect() as conn:
         return conn.execute(
-            """SELECT s.id, s.request_id, s.spec, s.model, s.created_at,
+            """SELECT s.id, s.request_id, s.spec, s.model, s.indicators, s.created_at,
                       r.survey, r.nl_text
                FROM specs s JOIN requests r ON r.id = s.request_id
                ORDER BY s.id DESC LIMIT %s""",   # 최신순
