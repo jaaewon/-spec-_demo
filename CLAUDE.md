@@ -60,7 +60,7 @@
         ▼
 [FastAPI]
   1) 설문 응답 → 자연어/슬롯 프롬프트 구성
-  2) indicators.csv 조회 (설문 섹터 + 최신 영업일로 필터) → 프롬프트에 주입
+  2) [미구현] indicators.csv 조회 → 프롬프트에 주입 — 코드에 없다 (§16-9)
   3) etf_universe.csv 주입
   4) Ollama 호출 (format = StrategySpec JSON Schema, temperature=0)
         │
@@ -74,13 +74,13 @@
   5) version/snapshot/seed 박제
   5-1) snapshot_date 를 as-of 키로 경제지표 조회 (§17) — 프롬프트엔 안 넣음, 기록만
   6) PostgreSQL 저장 (requests + specs, 지표 스냅샷 + 조정 내역 동봉)
-  5) Pydantic 검증 (스키마 + ETF 유니버스/레버리지 validator)
-  6) hardcaps.json 검수 ── 위반 시 400 (§8)
-  7) version/snapshot/seed 박제
-  8) PostgreSQL 저장 (requests + specs)
         │
         ▼
-[Browser: Spec JSON 렌더링]
+[Browser: Spec JSON 렌더링 + 백테스트 리포트/차트]
+        │  POST /backtest/{spec_id}
+        ▼
+[FastAPI] 저장된 Spec → pykrx 시세 → vectorbt 백테스트 → 리포트·plotly figure
+          (app/backtest.py, app/tickers.py — 범위 승인 미확인, §16-10)
 ```
 
 - **Ollama는 컨테이너 대신 호스트 실행 권장** (GPU 패스스루가 도커에서 번거로움). compose에서는 `host.docker.internal:11434`로 접근.
@@ -226,8 +226,13 @@ KODEX 미국채10년선물,308620,채권
 
 > 데모용 9~30종목이면 충분. 확장 시 명칭에 `레버리지/인버스/2X/곱버스` 포함 종목은 로드 단계에서 제외.
 
-## 8. 서버측 검증 — Validator 계층 구조
-### 경제지표 (`data/indicators.csv`)
+### 7.1 경제지표 더미 (`data/indicators.csv`) — **현재 읽는 코드 없음**
+
+> ⚠️ 아래는 이 파일을 프롬프트에 주입한다는 전제로 쓰인 설계 메모다.
+> **현행 코드에는 이 CSV 를 읽는 곳이 한 군데도 없다.** 지표 계층은
+> `data/economic_indicators.json` → DB as-of 조회(§17)로 구현돼 있고,
+> 백테스트는 pykrx 실시세에서 지표를 직접 계산한다(`app/backtest.py`).
+> 두 소스를 어떻게 정리할지는 미결정 (§16-9). 파일은 지우지 않는다.
 
 `date,name,code,close,volume,momentum_20d,rsi_14,ma_cross_5_20` — 유니버스 20종 × 최근 7영업일 = 140행. `name` 기준으로 유니버스와 조인한다 (양쪽 종목명·코드 완전 일치 확인됨). 위 CSV 취급 규칙(`utf-8-sig`, `code`는 str)이 그대로 적용된다.
 
@@ -236,10 +241,10 @@ KODEX 미국채10년선물,308620,채권
 - **`ma_cross_5_20`은 문자열**(`golden`/`neutral`/`dead`)인데 `SignalRule.threshold`는 `float`이다. "이평선 교차" 스타일로 생성된 signal을 이 컬럼에 그대로 적용할 수 없다 → 지표 CSV 쪽을 `1/0/-1`로 바꾸는 게 스키마를 건드리는 것보다 싸다. **미해결**.
 - `SignalRule.indicator`는 자유 문자열이라 LLM이 이 3종 밖의 지표명을 만들 수 있다. 조회 시 KeyError 방어 필요 (또는 `indicator`를 Enum 3종으로 승격).
 
-## 8. 서버측 검증 (Pydantic validator)
+## 8. 서버측 검증 — Validator 계층 구조
 
 기획서 4.1 의 4계층 중 이 데모가 구현한 건 **1·2·4계층**이다.
-스키마 통과 후 두 단계를 더 거친다: **① 유니버스/레버리지 무결성 → ② 하드캡 검수**.
+스키마(1계층)를 통과한 Spec 은 참조(2계층) → 하드캡(4계층) 순으로 두 단계를 더 거친다.
 
 | # | 계층 | 무엇을 보나 | 어디 | 실패 시 |
 |---|---|---|---|---|
@@ -248,9 +253,7 @@ KODEX 미국채10년선물,308620,채권
 | 3 | 논리 | 규칙끼리 모순되지 않는가 | (전용 계층 없음 — 4계층 진입부의 `find_logical_contradictions` 가 겸함) | **반려 400** |
 | 4 | 하드캡 | 시스템 상한을 넘지 않는가 | `validators.enforce_hardcaps` (§18) | **클램프 200** / 구조적 위반만 반려 400 |
 
-### 8.1 2계층 (참조) — 기존 그대로
-
-### ① 유니버스/레버리지 (`validators.py`)
+### 8.1 2계층 (참조) — 유니버스/레버리지 (`validators.py`)
 
 ```python
 LEVERAGE_KEYWORDS = ("레버리지", "인버스", "2X", "곱버스")
@@ -284,7 +287,7 @@ def validate_etfs(etfs: list[str], universe: set[str]) -> list[str]:
 
 자세한 내용(캡 값 근거, 프로파일 테이블, 스텁 3종)은 **§18**.
 
-### ② 하드캡 검수 (`data/hardcaps.json`)
+### 8.3 정적 하드캡 규칙 (`data/hardcaps.json`)
 
 유니버스 검증까지 통과한 Spec을 마지막으로 훑는 게이트. 규칙 4개뿐이므로 **범용 룰 엔진을 만들지 말고 조건문 4개로 읽는다** (형식은 나중에 엔진으로 승격 가능하게 선언형으로 둔 것).
 
@@ -306,6 +309,8 @@ def validate_etfs(etfs: list[str], universe: set[str]) -> list[str]:
 | GET | `/` | 설문 HTML 서빙 |
 | POST | `/compile` | 설문 응답 → LLM → 검증 → 저장 → Spec JSON 반환 |
 | GET | `/specs` | 저장된 Spec 목록 (검증/데모 확인용) |
+| POST | `/backtest/{spec_id}` | 저장된 Spec 을 vectorbt 로 백테스트 → 수치·텍스트 리포트·plotly figure |
+| GET | `/plotly.js` | 차트 라이브러리 로컬 서빙 (CDN 없이 오프라인 시연 대응) |
 | GET | `/indicators?as_of=YYYY-MM-DD` | 해당 시점에 **공개돼 있던** 최신 경제지표 (§17). 생략 시 오늘 |
 | GET | `/health` | Ollama·DB·지표 테이블·하드캡 프로파일 헬스체크 |
 
@@ -316,6 +321,9 @@ def validate_etfs(etfs: list[str], universe: set[str]) -> list[str]:
   "style": "momentum", "rebalance": "monthly", "note": "" }
 // res
 { "request_id": 12,
+  // 저장된 Spec 의 id. 프론트가 이 값으로 곧바로 POST /backtest/{spec_id} 를 부른다.
+  // 이 키를 빼면 index.html 의 백테스트 영역이 통째로 깨진다.
+  "spec_id": 12,
   // **하드캡 클램프가 적용된 최종본.** 조정이 있었으면 아래 clamps 와 대조해서 읽는다.
   "spec": { ...StrategySpec... },
   // spec.snapshot_date 기준 as-of 로 뜬 경제지표 스냅샷 (§17).
@@ -480,16 +488,17 @@ volumes: { pgdata: {} }
 │   ├── llm.py                # Ollama 호출 + 검증/재시도
 │   ├── db.py                 # Postgres 연결/저장/조회 (requests, specs)
 │   ├── indicators.py         # 경제지표 수집·적재·as-of 조회 (§17)
-│   └── validators.py         # 2계층 유니버스/레버리지 + 4계층 하드캡 (§8, §18)
+│   ├── validators.py         # 2계층 유니버스/레버리지 + 4계층 하드캡 (§8, §18)
+│   ├── tickers.py            # 종목명 → KRX 티커 (etf_universe.csv 에서 유도) + pykrx 시세
+│   └── backtest.py           # Spec → vectorbt 백테스트 → 리포트·차트 (범위 승인 미확인, §16-10)
 ├── db/
 │   └── schema.sql            # 테이블 DDL (컨테이너 최초 기동 시 1회 실행)
 ├── data/
-│   ├── etf_universe.json
+│   ├── etf_universe.csv           # 유니버스 화이트리스트 (name,code,theme) — §7
 │   ├── economic_indicators.json   # 경제지표 seed (실제 통계 아님, §17)
-│   └── hardcap_profile.json       # 하드캡 v1 seed + 값별 근거 (전부 잠정치, §18)
-│   ├── etf_universe.csv      # 유니버스 화이트리스트 (name,code,theme) — §7
-│   ├── indicators.csv        # 경제지표 더미 (date,name,code,close,volume,momentum_20d,rsi_14,ma_cross_5_20)
-│   └── hardcaps.json         # Spec 사후 검증용 하드캡 규칙
+│   ├── hardcap_profile.json       # 하드캡 v1 seed + 값별 근거 (전부 잠정치, §18)
+│   ├── indicators.csv             # 종목별 기술지표 더미 — **읽는 코드 없음** (§7.1, §16-9)
+│   └── hardcaps.json              # 정적 하드캡 규칙 — **읽는 코드 없음** (§8.3, §16-8)
 └── static/
     └── index.html
 ```
