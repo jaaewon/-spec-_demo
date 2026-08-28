@@ -173,22 +173,32 @@ def classify_intent(text: str, ctx: str, has_universe_sector: bool) -> str:
 # --------------------------------------------------------------------------
 
 def _scan_slots(text: str) -> dict:
-    """슬롯 5종 각각에 대해 '사용자가 언급했는가' + 근거 표현.
+    """슬롯 5종 각각에 대해 '사용자가 언급했는가' + 매치된 표현 + **그 표현이 가리키는 값**.
 
     값을 확정하려 들지 않는다는 게 중요하다. 여기서 정하는 건 **언급 여부**뿐이고,
     실제 값은 LLM 이 정한다. 스캔이 값까지 정해버리면 경로 1(슬롯 추출)이 돼서
     표현력 병목이 되살아난다 (CLAUDE.md §19.1).
+
+    다만 매치된 표현이 **어느 값을 가리키는지**(`implies`)는 함께 남긴다.
+    렉시콘이 동의어를 목표 enum 값으로 키잉해 두었기 때문에 공짜로 얻어지는 정보이고,
+    나중에 최종 Spec 과 대조해 "매치 표현과 결과가 어긋났는가"를 판정하는 데 쓴다
+    (§19.3.1). 이건 값을 정하는 게 아니라 **대조용 기록**이다.
     """
     slots = {}
     for name, table in (("sector", _SECTOR_TERMS), ("risk", _RISK_TERMS),
                         ("style", _STYLE_TERMS), ("rebalance", _REBALANCE_TERMS)):
-        evidence = None
-        for _key, terms in table.items():
+        term, implies = None, None
+        # 가장 앞에서 매치된 표현을 고른다. 슬롯당 하나만 기록하는 건 의도적이다 —
+        # 여러 개를 모으면 "무엇이 최종 값의 근거인가"를 스캔이 판단하는 꼴이 된다.
+        best = None
+        for key, terms in table.items():
             hit = _find(text, terms)
-            if hit:
-                evidence = hit[0]
-                break
-        slots[name] = {"mentioned": evidence is not None, "evidence": evidence}
+            if hit and (best is None or hit[1] < best[0]):
+                best = (hit[1], hit[0], key)
+        if best:
+            _, term, implies = best
+        slots[name] = {"mentioned": term is not None,
+                       "matched_term": term, "implies": implies}
 
     slots["max_loss"] = _scan_max_loss(text)
     return slots
@@ -203,8 +213,10 @@ def _scan_max_loss(text: str) -> dict:
     for m in _PCT_RE.finditer(text):
         ctx = _context(text, m.start(), m.end())
         if any(w in ctx for w in _LOSS_MARKERS):
-            return {"mentioned": True, "evidence": m.group(0)}
-    return {"mentioned": False, "evidence": None}
+            # implies 는 숫자 그 자체 — 대조할 때 spec 의 max_loss_pct 와 직접 비교한다
+            return {"mentioned": True, "matched_term": m.group(0),
+                    "implies": float(m.group(1))}
+    return {"mentioned": False, "matched_term": None, "implies": None}
 
 
 # --------------------------------------------------------------------------
@@ -264,22 +276,190 @@ def scan_free_text(text: str) -> dict:
     return {"slots": slots, "rejections": rejections, "notices": notices}
 
 
-def describe_slots(scan: dict, spec: dict) -> dict:
-    """스캔의 슬롯 출처와 **최종 Spec** 을 대조해 값별 출처를 확정한다.
+# 슬롯별 대조 결과. "조용히 통과"가 없는 validators.py 의 판정 상태와 같은 발상 —
+# **검사할 수 없는 것은 consistent 가 아니라 unverifiable 이다.**
+CHECK_CONSISTENT = "consistent"        # 매치 표현이 가리키는 값 == 최종 Spec 값
+CHECK_CONFLICT = "conflict"            # 어긋난다 — matched_term 을 근거로 제시하면 안 된다
+CHECK_UNVERIFIABLE = "unverifiable"    # 대조할 방법이 없다 (통과가 아니다)
 
-    요구사항: "어떤 값이 추론이고 어떤 값이 명시적 언급인지 응답에서 구분할 수 있어야 한다."
-    별도로 물어볼 필요가 없다 — 언급하지 않은 슬롯에 Spec 이 값을 갖고 있으면
-    그 값은 정의상 LLM 추론이다. 두 기록을 대조하면 계산된다.
+# conflict note 의 공통 꼬리말. **원인을 한쪽으로 단정하지 않는다** (CLAUDE.md §19.3.1).
+#
+# 두 가설이 같은 관측을 낳으므로 이 계층은 어느 쪽인지 알 수 없다. note 가
+# "사용자가 부정 표현을 썼습니다" 처럼 한쪽으로 단정하면 '구별 불가'라는 설계 결론을
+# note 가 뒤집는 꼴이 된다. 그래서 관측된 사실(무엇이 매치됐고, 최종 값이 무엇이며,
+# 둘이 어긋난다)까지만 쓰고 원인은 두 가설을 나란히 둔다.
+_CONFLICT_CAUSE = (
+    "어긋난 원인은 이 계층에서 판정할 수 없다 — "
+    "① 입력에 부정·완화 표현이 있고 LLM 이 그것을 옳게 반영한 경우와 "
+    "② LLM 이 입력을 반영하지 않은 경우가 같은 관측을 낳기 때문이다. "
+    "따라서 매치된 표현을 이 값의 근거로 제시하지 말 것.")
+
+
+def _check_sector(implies: str, term: str, spec: dict) -> tuple[str, str | None]:
+    """매치된 theme 의 ETF 가 실제로 선택됐는가.
+
+    theme 판정은 etf_universe.json 에서 파생한다 — 종목명→theme 을 여기 복제하지 않는다.
+    복합 의도("반도체 + 배당")는 picked 에 둘 다 들어가므로 오탐이 나지 않는다.
     """
+    themes = {it["name"]: it["theme"] for it in load_universe()}
+    picked = sorted({themes[n] for n in (spec.get("etfs") or []) if n in themes})
+    if implies in picked:
+        return CHECK_CONSISTENT, None
+    return CHECK_CONFLICT, (
+        f"입력에서 '{term}' 표현이 매치됐고 이 표현은 '{implies}' 테마를 가리킨다. "
+        f"그런데 최종 Spec 의 etfs 는 {spec.get('etfs')} 이고 그 테마 구성은 "
+        f"{picked or '없음'} 이라 '{implies}' 가 들어 있지 않다. " + _CONFLICT_CAUSE)
+
+
+def _check_max_loss(implies: float, term: str, spec: dict,
+                    clamps: list[dict]) -> tuple[str, str | None]:
+    """사용자가 말한 숫자와 Spec 값의 대조. **하드캡 조정 '전' 값과 비교한다.**
+
+    클램프가 있으면 matched_term("60%")과 최종 max_loss_pct(20.0)는 필연적으로
+    어긋난다. 그걸 conflict 로 부르면 오판이다 — 표현이 반전된 게 아니라 시스템이
+    의도적으로 조정한 것이고 이미 clamps 에 기록돼 있다.
+
+    다만 클램프가 설명하는 구간은 `requested → applied` **하나뿐이다.**
+    `implies → requested` 의 차이는 설명하지 않는다. 그래서 세 경우가 갈린다:
+
+        implies 60 / clamp(60 → 20)  : 사용자 요구를 하드캡이 깎았다        → consistent
+        implies 60 / clamp 없음 / spec 20 : 하드캡이 개입하지 않았는데 값이 다르다 → conflict
+        implies 60 / clamp(90 → 20)  : LLM 이 90 을 냈다. 클램프는 90→20 만
+                                       설명하므로 60→90 은 여전히 설명되지 않는다 → conflict
+    """
+    clamp = next((c for c in clamps if c.get("field") == "max_loss_pct"), None)
+    final = spec.get("max_loss_pct")
+
+    if clamp is None:
+        if final is not None and float(final) == implies:
+            return CHECK_CONSISTENT, None
+        return CHECK_CONFLICT, (
+            f"입력에서 '{term}' 표현이 매치됐고 이 표현은 {implies} 를 가리킨다. "
+            f"그런데 최종 Spec 의 max_loss_pct 값은 {final} 이고, 하드캡 조정 내역에 "
+            f"max_loss_pct 항목이 없어 이 차이를 설명하는 시스템 조정이 없다. "
+            + _CONFLICT_CAUSE)
+
+    requested, applied = float(clamp["requested"]), float(clamp["applied"])
+    if requested == implies:
+        # 값은 다르지만 그 차이가 **설명된** 경우. 이때도 note 를 붙이는 이유:
+        # matched_term 과 spec_value 가 눈에 띄게 다르므로, 이 항목만 읽는 쪽이
+        # clamps 를 따로 대조하지 않고도 왜 다른지 알 수 있어야 한다.
+        return CHECK_CONSISTENT, (
+            f"입력에서 '{term}' 표현이 매치됐고 이 표현은 {implies} 를 가리킨다. "
+            f"최종 Spec 의 max_loss_pct 값은 {applied} 이라 다르지만, 그 차이는 하드캡이 "
+            f"{requested} 를 {applied} 로 조정한 결과다. 입력과 어긋난 것이 아니다.")
+    return CHECK_CONFLICT, (
+        f"입력에서 '{term}' 표현이 매치됐고 이 표현은 {implies} 를 가리킨다. "
+        f"그런데 하드캡 조정 전 값이 이미 {requested} 였다 "
+        f"(하드캡이 {requested} 를 {applied} 로 깎아 최종 max_loss_pct 값은 {applied} 다). "
+        f"하드캡은 {requested} → {applied} 구간만 설명하므로 {implies} → {requested} 의 "
+        f"차이는 설명되지 않는다. " + _CONFLICT_CAUSE)
+
+
+def _check_enum_slot(name: str, implies: str, term: str,
+                     spec: dict) -> tuple[str, str | None]:
+    """risk / rebalance — 렉시콘 키가 곧 enum 값이라 그대로 비교된다.
+
+    (키가 실재하는 enum 값인지는 _check_keys 가 모듈 로드 시점에 보장한다.)
+    """
+    field = _SLOT_TO_SPEC_FIELD[name]
+    value = spec.get(field)
+    if implies == value:
+        return CHECK_CONSISTENT, None
+    return CHECK_CONFLICT, (
+        f"입력에서 '{term}' 표현이 매치됐고 이 표현은 '{implies}' 를 가리킨다. "
+        f"그런데 최종 Spec 의 {field} 값은 '{value}' 다. " + _CONFLICT_CAUSE)
+
+
+def _check_style(term: str) -> tuple[str, str | None]:
+    """style 은 **대조할 계약이 없다.** ok 가 아니라 판정 불가라고 말한다.
+
+    매매 스타일 → 지표 매핑(추세추종→momentum_20d 등)은 prompt.py 의 규칙 문장과
+    TradeStyle docstring 에 산문으로만 있고 기계가 읽는 계약이 아니다. 여기에 그
+    매핑을 복제하면 세 번째 사본이 되어 조용히 어긋난다. 게다가 signals 는 LLM 이
+    자유롭게 구성하는 리스트라(momentum_60d 를 쓰거나 규칙을 여러 개 조합할 수 있다)
+    단순 비교는 오탐(false conflict)을 대량으로 만든다.
+    """
+    return CHECK_UNVERIFIABLE, (
+        f"입력에서 '{term}' 표현이 매치됐지만 이 슬롯은 **판정 불가**다 "
+        f"(검사해서 통과한 것이 아니다). 매매 스타일 → 지표 매핑(예: 추세추종 → "
+        f"momentum_20d)이 프롬프트의 산문 규칙으로만 존재해 기계가 읽을 수 있는 계약이 "
+        f"아니고, 그 매핑을 대조용으로 복제하면 사본이 하나 더 늘어 조용히 어긋난다. "
+        f"최종 Spec 의 signals 가 '{term}' 표현과 맞는지는 확인되지 않았다.")
+
+
+def _check_slot(name: str, rec: dict, spec: dict,
+                clamps: list[dict]) -> tuple[str, str | None]:
+    """슬롯 하나의 대조 → (판정, note). note 는 consistent 일 때 보통 None 이다."""
+    implies, term = rec["implies"], rec["matched_term"]
+    if name == "sector":
+        return _check_sector(implies, term, spec)
+    if name == "max_loss":
+        return _check_max_loss(implies, term, spec, clamps)
+    if name in ("risk", "rebalance"):
+        return _check_enum_slot(name, implies, term, spec)
+    return _check_style(term)
+
+
+def describe_slots(scan: dict, spec: dict, clamps: list[dict] | None = None) -> dict:
+    """스캔의 슬롯 기록과 **최종 Spec** 을 대조해 값별 출처와 정합성을 낸다.
+
+    두 개의 서로 다른 질문에 **각각의 필드**로 답한다. 하나로 합치면 안 되는 이유가
+    이 함수가 고쳐진 이유이기도 하다 (CLAUDE.md §19.3.1):
+
+      source : 사용자가 이 슬롯을 **언급했는가**.
+               "너무 공격적이진 않게" 는 위험 성향을 분명히 언급한 것이므로 explicit 이다.
+               언급 안 한 슬롯에 Spec 이 값을 가지면 그 값은 정의상 LLM 추론이다.
+
+      check  : 매치된 표현이 **최종 값과 맞는가**.
+               위 입력에서 매치된 표현은 "공격"(→ aggressive)인데 Spec 은 conservative 다.
+               → conflict. **matched_term 을 사용자에게 '근거'로 제시하면 안 된다.**
+
+    source 에 explicit_conflict 같은 값을 추가하지 않는다. 그러면 "언급했는가"라는
+    질문의 답이 대조 결과에 오염된다. 질문이 둘이므로 필드도 둘이다.
+
+    matched_term 을 evidence 라고 부르지 않는 이유도 여기 있다. 그 문자열은
+    "이 표현이 입력에 있었다"는 **사실 기록**이지 "이것이 그 값의 근거다"가 아니다.
+    부정·완화 표현이 붙으면 정반대를 가리킬 수 있다. 지우지 않고 남기는 이유는
+    스캔이 무엇에 걸렸는지가 있어야 디버깅과 감사가 되기 때문이다.
+
+    implies 는 **check 계산의 입력**이다 — 매치 표현이 가리키는 값(`"공격"` →
+    `"aggressive"`). 응답에도 남긴다: 이게 없으면 conflict 판정의 한쪽 항이 보이지
+    않아 "무엇과 무엇이 어긋났는가"를 응답만 보고 확인할 수 없다.
+
+    clamps 를 받는 이유는 max_loss 때문이다. 하드캡이 깎으면 matched_term 과
+    최종 값이 **필연적으로** 달라지므로, 그걸 conflict 로 부르면 오판이 된다.
+    다만 클램프가 설명하는 구간은 `requested → applied` 하나뿐이다 (_check_max_loss).
+
+    **conflict 의 원인은 둘이고 이 함수는 둘을 구별하지 못한다** (§19.3.1):
+      ① 사용자가 부정·완화 표현을 썼고 LLM 이 옳게 읽었다 → Spec 이 맞다
+      ② LLM 이 사용자 말을 무시했다                      → Spec 이 틀렸다
+    구별은 못 하지만 두 경우 모두 "matched_term 을 근거로 내밀지 마라"는 결론이 같아
+    판정 자체는 쓸모가 있다. ②는 현재 다른 어떤 계층도 잡지 못하는 결함이다.
+    §19.3 의 요구/언급 구별 불가와 같은 계열의 한계다 — 어휘 매칭이 문장의 뜻을
+    읽지 못한다는 하나의 원인에서 나온다.
+    """
+    clamps = clamps or []
     out = {}
     for name, field in _SLOT_TO_SPEC_FIELD.items():
         rec = scan["slots"][name]
-        out[name] = {
+        item = {
             "source": "explicit" if rec["mentioned"] else "inferred",
-            "evidence": rec["evidence"],
+            "matched_term": rec["matched_term"],
+            "implies": rec["implies"],
             "spec_field": field,
             "spec_value": spec.get(field),
+            # 언급이 없으면 대조할 대상이 없다. conflict 도 consistent 도 아니다.
+            "check": None,
         }
+        if rec["mentioned"]:
+            item["check"], note = _check_slot(name, rec, spec, clamps)
+            # note 는 API 응답에 그대로 실린다 → 항목마다 자립적이어야 한다.
+            # 다른 필드를 읽어야 뜻이 통하는 문장이나 약칭을 쓰지 않는다
+            # (셀프체크 ②-f 가 assert 한다).
+            if note:
+                item["note"] = note
+        out[name] = item
     return out
 
 
@@ -299,8 +479,8 @@ if __name__ == "__main__":
     assert s["notices"] == [], s["notices"]
     for slot in ("sector", "risk", "max_loss", "style", "rebalance"):
         assert s["slots"][slot]["mentioned"], (slot, s["slots"][slot])
-    assert s["slots"]["sector"]["evidence"] == "반도체"
-    assert s["slots"]["max_loss"]["evidence"] == "10%"
+    assert s["slots"]["sector"]["matched_term"] == "반도체"
+    assert s["slots"]["max_loss"]["matched_term"] == "10%"
 
     # ── ② 미언급 슬롯이 구분된다 (요구사항: 지어내지 말고 구분되게)
     s = scan("반도체 쪽에 투자하고 싶어요.")
@@ -312,9 +492,131 @@ if __name__ == "__main__":
     spec = {"etfs": ["KODEX 반도체"], "risk_profile": "neutral", "max_loss_pct": 5,
             "signals": [{"indicator": "momentum_20d"}], "rebalance": "monthly"}
     d = describe_slots(s, spec)
-    assert d["sector"]["source"] == "explicit" and d["sector"]["evidence"] == "반도체"
+    assert d["sector"]["source"] == "explicit" and d["sector"]["matched_term"] == "반도체"
+    assert d["sector"]["check"] == CHECK_CONSISTENT
     assert d["rebalance"]["source"] == "inferred" and d["rebalance"]["spec_value"] == "monthly"
     assert d["risk"]["source"] == "inferred"
+    # 언급이 없으면 대조할 대상이 없다 — conflict 도 consistent 도 아니다
+    assert d["risk"]["check"] is None and d["rebalance"]["check"] is None
+
+    # ── note 자립성 검사기. **note 는 API 응답에 그대로 실린다** — 항목마다 혼자
+    #    읽어도 뜻이 통해야 하고, 다른 필드를 대조해야 이해되는 문장이면 안 된다.
+    #    직전 커밋에서 렉시콘 reason 의 약칭이 그대로 API 로 나간 것과 같은 유형의 결함이라,
+    #    사람 눈이 아니라 assert 로 막는다. 아래 describe_slots 호출 전부가 이걸 통과한다.
+    _ABBREV = ("위와 같음", "위와 동일", "상동", "위 참고", "위 항목", "동일함", "앞서 말한")
+    # note 가 불일치 원인을 한쪽으로 **단정**하면 안 된다 (§19.3.1). 두 원인은
+    # 구별 불가라는 것이 설계이므로, 단정하는 순간 note 가 그 결론을 뒤집는다.
+    _VERDICT_PHRASES = ("사용자가 부정 표현을 사용했", "LLM 이 무시했다", "LLM 이 무시한",
+                        "사용자가 반대로 말했", "LLM 오류다", "사용자 실수")
+
+    def assert_notes_ok(described: dict) -> dict:
+        for slot_name, item in described.items():
+            note = item.get("note")
+            if note is None:
+                # note 없이 남을 수 있는 건 '어긋난 것도 판정 불가도 아닌' 경우뿐이다
+                assert item["check"] in (CHECK_CONSISTENT, None), (slot_name, item)
+                continue
+            for a in _ABBREV:
+                assert a not in note, f"{slot_name}: 약칭 '{a}' 이 API 로 나간다 — {note}"
+            for v in _VERDICT_PHRASES:
+                assert v not in note, f"{slot_name}: 원인을 단정한다 '{v}' — {note}"
+            # 자립성: 매치 표현과 Spec 필드 이름이 문장 안에 그대로 있어야
+            # note 하나만 읽고도 무엇이 무엇과 어긋났는지 알 수 있다
+            assert item["matched_term"] in note, f"{slot_name}: 매치 표현이 없다 — {note}"
+            assert item["spec_field"] in note, f"{slot_name}: Spec 필드명이 없다 — {note}"
+            if item["check"] == CHECK_CONFLICT:
+                # 두 가설이 **모두** 적혀 있어야 한쪽으로 단정하지 않은 것이다
+                assert "①" in note and "②" in note, f"{slot_name}: 가설이 하나뿐 — {note}"
+                assert "판정할 수 없다" in note, f"{slot_name}: {note}"
+        return described
+
+    assert_notes_ok(d)
+
+    # ── ②-b 부정·완화 표현 (§19.3.1). **이 절이 이 파일에서 가장 중요한 케이스다.**
+    #      "너무 공격적이진 않게" 는 위험 성향을 분명히 '언급' 했으므로 source 는 explicit 이
+    #      맞다. 문제는 매치된 표현이 '공격'(→aggressive)인데 결과는 conservative 라는 것.
+    #      matched_term 을 근거로 UI 에 그대로 내보내면 사용자는 정반대 문구를 보게 된다.
+    neg = scan("너무 공격적이진 않게 반도체 ETF를 담고 싶어요")
+    assert neg["slots"]["risk"]["mentioned"] is True
+    assert neg["slots"]["risk"]["matched_term"] == "공격"
+    assert neg["slots"]["risk"]["implies"] == "aggressive"
+
+    conservative_spec = {**spec, "risk_profile": "conservative"}
+    d_neg = assert_notes_ok(describe_slots(neg, conservative_spec))
+    assert d_neg["risk"]["source"] == "explicit", "언급은 실제로 있었다"
+    assert d_neg["risk"]["check"] == CHECK_CONFLICT, d_neg["risk"]
+    assert "근거로 제시하지 말 것" in d_neg["risk"]["note"]
+    #      두 질문이 **각각의 필드**로 분리돼 있다 — source 가 대조 결과에 오염되지 않는다
+    assert set(d_neg["risk"]) >= {"source", "check", "matched_term"}, d_neg["risk"]
+    assert d_neg["risk"]["source"] in ("explicit", "inferred"), "source 를 오버로드하지 않는다"
+    #      필드 이름 자체가 '근거' 로 읽히지 않아야 한다 (§19.3.1)
+    assert "evidence" not in d_neg["risk"], "evidence 라는 이름은 근거로 오독된다"
+    #      implies 는 check 계산의 입력이고 응답에도 남는다 — 이게 없으면 conflict 판정의
+    #      한쪽 항이 보이지 않아 "무엇과 무엇이 어긋났는가"를 응답만 보고 확인할 수 없다
+    assert d_neg["risk"]["implies"] == "aggressive", d_neg["risk"]
+
+    #      LLM 이 사용자 말대로 aggressive 를 냈다면 같은 입력이라도 conflict 가 아니다
+    d2 = assert_notes_ok(describe_slots(neg, {**spec, "risk_profile": "aggressive"}))
+    assert d2["risk"]["check"] == CHECK_CONSISTENT
+
+    # ── ②-c 다른 슬롯의 반전도 같은 경로로 잡힌다
+    #      섹터: theme 대조를 etf_universe.json 에서 파생하므로 매핑을 복제하지 않는다
+    sec = scan("반도체 말고 배당 쪽으로 부탁해요")
+    d = assert_notes_ok(describe_slots(sec, {**spec, "etfs": ["KODEX 배당가치"]}))
+    assert d["sector"]["check"] == CHECK_CONFLICT, d["sector"]
+    #      복합 의도는 오탐이 아니다 — 두 테마가 다 담기면 매치된 쪽이 들어 있으므로 통과
+    d = assert_notes_ok(describe_slots(
+        sec, {**spec, "etfs": ["KODEX 반도체", "KODEX 배당가치"]}))
+    assert d["sector"]["check"] == CHECK_CONSISTENT, d["sector"]
+    #      리밸런싱
+    rb = scan("주 1회는 너무 잦으니 그건 말고요")
+    d = assert_notes_ok(describe_slots(rb, {**spec, "rebalance": "quarterly"}))
+    assert d["rebalance"]["check"] == CHECK_CONFLICT, d["rebalance"]
+
+    # ── ②-d style 은 **대조 불가**다. ok 라고 하지 않는다 (validators 의 스텁과 같은 방침).
+    st = scan("추세추종으로 가주세요")
+    d = assert_notes_ok(describe_slots(st, spec))
+    assert d["style"]["source"] == "explicit"
+    assert d["style"]["check"] == CHECK_UNVERIFIABLE, d["style"]
+    assert d["style"]["note"], "판정 불가 사유가 반드시 있어야 한다"
+
+    # ── ②-e 하드캡 클램프에 기인한 차이를 conflict 로 오판하지 않는다.
+    #      클램프가 설명하는 구간은 requested → applied **하나뿐**이라는 게 요점이다.
+    ml = scan("손실은 25%까지 감수할게요")
+    assert ml["slots"]["max_loss"]["implies"] == 25.0
+
+    #      ⓐ 사용자가 25 를 요구했고 하드캡이 20 으로 깎았다 → 정상. conflict 아님
+    d = assert_notes_ok(describe_slots(
+        ml, {**spec, "max_loss_pct": 20.0},
+        [{"field": "max_loss_pct", "requested": 25.0, "applied": 20.0}]))
+    assert d["max_loss"]["check"] == CHECK_CONSISTENT, d["max_loss"]
+    #      값이 눈에 띄게 다르므로 이 항목만 읽는 쪽을 위해 사유를 남긴다
+    assert "하드캡" in d["max_loss"]["note"], d["max_loss"]
+
+    #      ⓑ 하드캡이 개입하지 않았는데 값이 다르다 → 진짜 어긋난 것 (원인 ②번 유형)
+    d = assert_notes_ok(describe_slots(ml, {**spec, "max_loss_pct": 3.0}))
+    assert d["max_loss"]["check"] == CHECK_CONFLICT, d["max_loss"]
+
+    #      ⓒ **클램프가 있어도 면죄되지 않는다.** LLM 이 90 을 냈고 하드캡이 90→20 을
+    #      깎은 경우, 클램프는 90→20 만 설명하고 25→90 은 설명하지 않는다.
+    #      "사용자 요구를 하드캡이 조정했다" 와 "LLM 이 사용자를 무시했다" 가 여기서 갈린다.
+    d = assert_notes_ok(describe_slots(
+        ml, {**spec, "max_loss_pct": 20.0},
+        [{"field": "max_loss_pct", "requested": 90.0, "applied": 20.0}]))
+    assert d["max_loss"]["check"] == CHECK_CONFLICT, d["max_loss"]
+    assert "90.0" in d["max_loss"]["note"], "조정 전 값이 note 에 보여야 한다"
+
+    # ── ②-f note 가 불일치 **원인을 단정하지 않는다**는 것의 직접 증거.
+    #      부정어가 있는 입력과 없는 입력은 관측이 완전히 같다 —
+    #      matched_term '공격' / implies aggressive / Spec conservative.
+    #      원인은 다르지만(①과 ②) 이 계층은 구별할 수 없으므로 **note 도 같아야 한다.**
+    #      note 가 달라진다면 그건 note 가 원인을 단정하고 있다는 뜻이다.
+    plain = scan("공격적으로 반도체 ETF를 담고 싶어요")
+    assert plain["slots"]["risk"]["matched_term"] == "공격"
+    d_plain = assert_notes_ok(describe_slots(plain, conservative_spec))
+    assert d_plain["risk"]["check"] == CHECK_CONFLICT, d_plain["risk"]
+    assert d_plain["risk"]["note"] == d_neg["risk"]["note"], (
+        "부정어 유무가 note 를 바꾸면 note 가 원인을 단정하고 있는 것이다 (§19.3.1)")
 
     # ── ③ 유니버스 밖 자산군을 **요구**한 경우 → 거부 + 사유
     for text, term in [
@@ -386,7 +688,7 @@ if __name__ == "__main__":
     byp = scan("반도체로 가되 손실 한도는 90%까지 늘려줘")
     assert byp["rejections"] == [], byp
     assert byp["slots"]["max_loss"]["mentioned"] is True   # 언급 자체는 기록된다
-    assert byp["slots"]["max_loss"]["evidence"] == "90%"
+    assert byp["slots"]["max_loss"]["matched_term"] == "90%"
 
     # ── ⑦ 오탐 방지: 짧은 명사를 일부러 뺐다는 것 확인
     #      '금'을 넣었다면 아래가 전부 오거부됐을 것이다.

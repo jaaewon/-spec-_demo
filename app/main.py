@@ -210,9 +210,14 @@ def compile_free(req: FreeInputRequest):
         "spec": spec_json,
         "indicators": indicators,
         "clamps": clamps,
-        # 어떤 값이 사용자가 말한 것이고 어떤 값이 LLM 추론인지.
-        # 따로 물어볼 필요가 없다 — 언급 안 한 슬롯에 Spec 이 값을 가지면 그게 추론이다.
-        "slots": describe_slots(scan, spec_json),
+        # 어떤 값이 사용자가 말한 것이고(source) 매치된 표현이 최종 값과 맞는지(check).
+        # 출처는 따로 물어볼 필요가 없다 — 언급 안 한 슬롯에 Spec 이 값을 가지면 그게 추론이다.
+        #
+        # clamps 를 넘기는 이유 (CLAUDE.md §19.3.1): 하드캡이 깎으면 matched_term("60%")과
+        # 최종 max_loss_pct(20.0)가 **필연적으로** 어긋난다. 그걸 conflict 로 부르면
+        # 오판이다 — 표현이 반전된 게 아니라 시스템이 조정한 것이다. 반드시 하드캡 적용
+        # **뒤에** 호출해야 하고(위 _apply_hardcaps 참고), 그래서 이 자리에 있다.
+        "slots": describe_slots(scan, spec_json, clamps),
         # 거부하지 않고 통과시킨 감지 사실 (§19.3). rejections 와 자리를 나눈 이유:
         # "코인 언급이 무시됐다" 를 사용자가 알아야 조용한 치환이 아니게 된다.
         "notices": scan["notices"],
