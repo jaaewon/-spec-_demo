@@ -112,13 +112,18 @@ _PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 # --------------------------------------------------------------------------
 
 def _find(text: str, terms: list[str]) -> tuple[str, int, int] | None:
-    """terms 중 처음 등장하는 것을 (표현, 시작, 끝) 으로. 대소문자 무시."""
+    """terms 중 처음 등장하는 것을 (표현, 시작, 끝) 으로. 대소문자 무시.
+
+    같은 위치에서 겹치면 **가장 긴 표현**이 이긴다. "레버리지" 와 "레버" 가 둘 다
+    0번째에서 매치될 때 짧은 쪽을 고르면 사용자에게 보이는 근거가 '레버' 가 돼
+    무슨 말인지 알 수 없다. 판정 자체는 같지만 사유의 품질이 달라진다.
+    """
     upper = text.upper()
-    hits = [(upper.find(t.upper()), t) for t in terms]
-    hits = [(i, t) for i, t in hits if i >= 0]
+    hits = [(upper.find(t.upper()), -len(t), t) for t in terms]
+    hits = [h for h in hits if h[0] >= 0]
     if not hits:
         return None
-    start, term = min(hits)
+    start, _, term = min(hits)   # 위치 오름차순 → 길이 내림차순
     return term, start, start + len(term)
 
 
@@ -348,6 +353,12 @@ if __name__ == "__main__":
     # ── ⑤ 레버리지/인버스: 요구는 차단, 언급은 통과
     s = scan("레버리지 반도체 담아줘")
     assert s["rejections"] and s["rejections"][0]["category"] == "leverage", s
+    # 같은 위치에 겹치는 '레버' 가 아니라 긴 쪽이 사유에 실려야 읽을 수 있는 근거가 된다
+    assert s["rejections"][0]["term"] == "레버리지", s["rejections"][0]
+
+    # 거부 사유는 자립적이어야 한다 — 응답에 그대로 실리므로 "위와 같음" 류는 안 된다
+    for entry in _OUT_OF_UNIVERSE:
+        assert "위와 같음" not in entry["reason"], entry
     s = scan("인버스로 헤지하고 싶어요")
     assert s["rejections"] and s["rejections"][0]["category"] == "leverage", s
     s = scan("2배 가는 걸로 넣어주세요")

@@ -28,16 +28,16 @@
 
   "out_of_universe_assets": [
     { "term": "코인",     "reason": "KRX 상장 ETF 가 아니다 — 데모 제약이 'KRX 상장 비레버리지 ETF만'(CLAUDE.md §2)" },
-    { "term": "암호화폐", "reason": "위와 같음" },
-    { "term": "가상자산", "reason": "위와 같음" },
-    { "term": "비트코인", "reason": "위와 같음" },
-    { "term": "이더리움", "reason": "위와 같음" },
+    { "term": "암호화폐", "reason": "KRX 상장 ETF 가 아니다 — 데모 제약이 'KRX 상장 비레버리지 ETF만'(CLAUDE.md §2)" },
+    { "term": "가상자산", "reason": "KRX 상장 ETF 가 아니다 — 데모 제약이 'KRX 상장 비레버리지 ETF만'(CLAUDE.md §2)" },
+    { "term": "비트코인", "reason": "KRX 상장 ETF 가 아니다 — 데모 제약이 'KRX 상장 비레버리지 ETF만'(CLAUDE.md §2)" },
+    { "term": "이더리움", "reason": "KRX 상장 ETF 가 아니다 — 데모 제약이 'KRX 상장 비레버리지 ETF만'(CLAUDE.md §2)" },
     { "term": "밈주식",   "reason": "개별종목 카테고리이고 etf_universe.json 의 어느 theme 에도 없다" },
     { "term": "부동산",   "reason": "유니버스에 부동산 테마 ETF 가 없다 (theme 7종에 부재)" },
-    { "term": "리츠",     "reason": "위와 같음" },
+    { "term": "리츠",     "reason": "유니버스에 부동산/리츠 테마 ETF 가 없다 (theme 7종에 부재)" },
     { "term": "원자재",   "reason": "유니버스에 원자재 테마 ETF 가 없다 (theme 7종에 부재)" },
-    { "term": "골드",     "reason": "위와 같음. 단어 '금'은 일부러 넣지 않았다 — 아래 _excluded_terms 참고" },
-    { "term": "유가",     "reason": "위와 같음" }
+    { "term": "골드",     "reason": "유니버스에 원자재 테마 ETF 가 없다 (theme 7종에 부재). 단어 '금'은 일부러 넣지 않았다 — _excluded_terms 참고" },
+    { "term": "유가",     "reason": "유니버스에 원자재 테마 ETF 가 없다 (theme 7종에 부재)" }
   ],
 
   "_excluded_terms": {
