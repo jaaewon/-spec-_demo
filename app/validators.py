@@ -188,7 +188,12 @@ def check_mdd_pct(spec: dict | None, profile: dict) -> dict:
 
     spec 인자를 아예 쓰지 않는다는 것 자체가 판정 불가의 증거다:
     MDD 는 수익률 시계열에서만 나오는 값이라 Spec 을 아무리 들여다봐도 계산할 수 없다.
-    이 데모에는 백테스트 계층이 없다.
+
+    <<사유 갱신 2026-08-29>> "백테스트 계층이 없다"는 원래 사유는 소멸했다 —
+    app/backtest.py 가 max_drawdown_pct 를 실제로 산출한다. 그래도 판정을 켜지 않는 이유는
+    (a) mdd_pct_cap 절대값에 근거가 없고, (b) 백테스트는 /compile 과 별도 요청이라
+    Spec 생성 시점에는 여전히 MDD 를 모르며, (c) 백테스트의 범위 편입이 미승인이기 때문이다.
+    셋 다 팀 결정 사항이다 (CLAUDE.md §16-10).
 
     그런데도 profile 에 값(30)을 두는 이유: '1회 손실 한도(20) < MDD 상한(30)' 관계를
     지금부터 명시해 두려는 것. 절대값 30 은 잠정치이고, P3 에서 유니버스 실측 MDD 를
@@ -197,8 +202,9 @@ def check_mdd_pct(spec: dict | None, profile: dict) -> dict:
     return {
         "cap": "mdd_pct_cap", "field": None, "limit": float(profile["mdd_pct_cap"]),
         "status": STATUS_UNDECIDABLE,
-        "reason": "MDD 는 수익률 시계열에서만 산출되는데 이 데모에는 백테스트 계층이 없다. "
-                  "Spec 만으로는 판정할 수 없다 — P3 백테스트 계층에서 구현.",
+        "reason": "MDD 는 수익률 시계열에서만 산출되는데 Spec 만으로는 시계열을 알 수 없다. "
+                  "백테스트 계층(app/backtest.py)은 존재하나 /compile 과 별도 요청이고, "
+                  "캡 절대값 근거와 범위 편입이 미확정이라 판정하지 않는다 (§16-10).",
     }
 
 
