@@ -18,6 +18,8 @@
   button[disabled] { opacity: .5; cursor: progress; }
   pre { background: #8881; padding: 1rem; border-radius: 8px; overflow-x: auto; }
   .err { color: #dc2626; white-space: pre-wrap; }
+  #chart { margin: 0 0 1rem; }
+  #chart:empty { display: none; }
 </style>
 </head>
 <body>
@@ -75,10 +77,82 @@
 <h2>결과 Spec</h2>
 <pre id="out">설문을 제출하세요.</pre>
 
+<h2>백테스트 리포트</h2>
+<div id="chart"></div>
+<pre id="bt">Spec 이 생성되면 자동으로 실행됩니다. (초기자본 1천만원 · 최근 5년)</pre>
+
 <script>
 const form = document.getElementById('survey');
 const btn = document.getElementById('go');
 const out = document.getElementById('out');
+const bt = document.getElementById('bt');
+const chart = document.getElementById('chart');
+
+// 경과 초를 찍어 주는 진행 표시. 컴파일도 백테스트도 수 초~수십 초 걸려
+// 표시가 없으면 멈춘 걸로 보인다. 반환값을 clearInterval 로 꺼야 한다.
+function progress(el, label) {
+  const t0 = Date.now();
+  return setInterval(() => {
+    el.textContent = `${label}... ${Math.round((Date.now() - t0) / 1000)}초`;
+  }, 200);
+}
+
+// plotly.js 는 4.5MB 라 페이지를 열 때가 아니라 첫 백테스트가 끝난 뒤에 받는다.
+// 설문만 보는 사람이 차트 라이브러리를 받을 이유가 없다.
+// 서버(/plotly.js)가 직접 내려주므로 CDN 없이 오프라인에서도 그려진다.
+let plotlyLoading = null;
+function loadPlotly() {
+  if (!plotlyLoading) {
+    plotlyLoading = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = '/plotly.js';
+      s.onload = resolve;
+      // 실패하면 다음 시도에서 다시 받도록 캐시된 Promise 를 비운다.
+      s.onerror = () => { plotlyLoading = null; reject(new Error('/plotly.js 로드 실패')); };
+      document.head.appendChild(s);
+    });
+  }
+  return plotlyLoading;
+}
+
+// 서버가 만든 plotly figure 를 그대로 그린다.
+// 배경/글자색만 페이지에 맞춰 덮어써서 다크 모드에서도 읽힌다.
+async function drawChart(fig) {
+  await loadPlotly();
+  const layout = Object.assign({}, fig.layout, {
+    paper_bgcolor: 'rgba(0,0,0,0)',
+    plot_bgcolor: 'rgba(0,0,0,0)',
+    font: Object.assign({}, fig.layout.font, { color: getComputedStyle(document.body).color }),
+    margin: { t: 30, r: 20, b: 40, l: 60 },
+    height: 560,
+  });
+  Plotly.newPlot(chart, fig.data, layout, { responsive: true, displaylogo: false });
+}
+
+// 생성된 Spec 을 그대로 백테스트에 태운다.
+// 컴파일과 분리된 별도 요청이라, 백테스트가 실패해도 Spec 결과는 그대로 남는다.
+async function runBacktest(specId) {
+  bt.className = '';
+  const tick = progress(bt, '백테스트 중');
+  try {
+    const res = await fetch(`/backtest/${specId}`, { method: 'POST' });
+    const data = await res.json();
+    clearInterval(tick);
+    if (!res.ok) {
+      bt.className = 'err';
+      bt.textContent = `${res.status} 실패\n\n` + JSON.stringify(data.detail, null, 2);
+    } else {
+      bt.textContent = data.report;   // 서버가 만든 텍스트 리포트를 그대로 렌더
+      // 차트 실패가 리포트까지 날리면 안 된다. 텍스트를 먼저 띄우고 따로 감싼다.
+      try { await drawChart(data.chart); }
+      catch (e) { chart.textContent = '차트를 불러오지 못했습니다: ' + e.message; }
+    }
+  } catch (err) {
+    clearInterval(tick);
+    bt.className = 'err';
+    bt.textContent = String(err);
+  }
+}
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -87,11 +161,12 @@ form.addEventListener('submit', async (e) => {
 
   btn.disabled = true;
   out.className = '';
+  bt.className = '';
+  bt.textContent = 'Spec 생성 대기 중...';   // 이전 실행 결과를 지운다
+  if (window.Plotly) Plotly.purge(chart);   // 이전 차트 정리
+  chart.innerHTML = '';
   // 로컬 8B라 30~60초 걸린다. 진행 표시가 없으면 멈춘 걸로 보임.
-  const t0 = Date.now();
-  const tick = setInterval(() => {
-    out.textContent = `컴파일 중... ${Math.round((Date.now() - t0) / 1000)}초`;
-  }, 200);
+  const tick = progress(out, '컴파일 중');
 
   try {
     const res = await fetch('/compile', {
@@ -104,8 +179,10 @@ form.addEventListener('submit', async (e) => {
     if (!res.ok) {
       out.className = 'err';
       out.textContent = `${res.status} 거부됨\n\n` + JSON.stringify(data.detail, null, 2);
+      bt.textContent = 'Spec 이 생성되지 않아 백테스트를 건너뜁니다.';
     } else {
       out.textContent = JSON.stringify(data.spec, null, 2);
+      await runBacktest(data.spec_id);   // Spec 이 나왔으면 이어서 백테스트
     }
   } catch (err) {
     clearInterval(tick);

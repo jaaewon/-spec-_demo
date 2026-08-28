@@ -72,3 +72,12 @@ def list_specs(limit: int = 20) -> list[dict]:
                ORDER BY s.id DESC LIMIT %s""",   # 최신순
             (limit,),
         ).fetchall()
+
+
+def get_spec(spec_id: int) -> dict | None:
+    """Spec 하나 조회. 없으면 None (main.py 에서 404 로 변환)."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT id, request_id, spec, model, created_at FROM specs WHERE id = %s",
+            (spec_id,),
+        ).fetchone()

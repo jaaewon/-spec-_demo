@@ -11,16 +11,17 @@
 """
 
 import os
+from functools import lru_cache
 
 import ollama
 import psycopg
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
-from app.db import list_specs, save_request, save_spec
+from app.db import get_spec, list_specs, save_request, save_spec
 from app.llm import compile_spec
 from app.prompt import build_user
-from app.schemas import SurveyRequest
+from app.schemas import StrategySpec, SurveyRequest
 
 # 설정은 전부 환경변수로 (docker-compose.yml 의 environment 참고).
 # os.environ[...] 은 없으면 즉시 KeyError → 설정 누락을 기동 시점에 바로 알 수 있다.
@@ -68,8 +69,10 @@ def compile_(survey: SurveyRequest):
         raise HTTPException(status_code=503, detail=f"LLM 호출 실패: {e}")
 
     spec_json = spec.model_dump(mode="json")
-    save_spec(request_id, spec_json, OLLAMA_MODEL)  # 어떤 모델이 만들었는지도 함께 박제
-    return {"request_id": request_id, "spec": spec_json}
+    spec_id = save_spec(request_id, spec_json, OLLAMA_MODEL)  # 어떤 모델이 만들었는지도 함께 박제
+    # spec_id 를 돌려주는 이유: 프론트가 바로 POST /backtest/{spec_id} 를 호출할 수 있어야 한다.
+    # (기존 키는 그대로 두므로 이 응답을 쓰던 쪽은 영향 없다)
+    return {"request_id": request_id, "spec_id": spec_id, "spec": spec_json}
 
 
 @app.get("/specs")
@@ -80,6 +83,65 @@ def specs(limit: int = 20):
     limit=999999 로 DB 를 통째로 긁어가지 못하게 상한을 건다.
     """
     return list_specs(min(limit, 100))
+
+
+@app.post("/backtest/{spec_id}")
+def backtest_(spec_id: int, years: int | None = None):
+    """저장된 Spec 을 vectorbt 로 백테스트하고 리포트를 반환.
+
+    초기 자본 1천만원, 기본 구간은 오늘로부터 5년 (app/backtest.py 의 상수).
+    한 번에 수 초~수십 초 걸린다 (pykrx 시세 조회 + 최초 호출 시 numba 컴파일).
+    """
+    row = get_spec(spec_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Spec 없음: id={spec_id}")
+
+    # 지연 임포트: vectorbt/pandas 는 무겁다. 백테스트를 안 쓰는 사람이 /compile 만
+    # 쓸 때 앱 기동이 느려지지 않도록 여기서 들여온다.
+    from app.backtest import DEFAULT_YEARS, format_report, run_backtest
+
+    spec = StrategySpec.model_validate(row["spec"])
+    try:
+        # years 는 쿼리스트링이라 사용자가 조작할 수 있다. 상한을 걸어
+        # years=9999 로 KRX 를 통째로 긁는 요청을 막는다.
+        result = run_backtest(spec, years=min(years or DEFAULT_YEARS, 10))
+    except ValueError as e:
+        # 티커 매핑 누락 / 지원하지 않는 지표 → Spec 쪽 문제
+        raise HTTPException(status_code=400, detail=f"백테스트 불가: {e}")
+    except Exception as e:
+        # pykrx 조회 실패 등 외부 사정
+        raise HTTPException(status_code=503, detail=f"시세 조회 실패: {e}")
+
+    return {
+        "spec_id": spec_id,
+        "spec": row["spec"],
+        "metrics": result.metrics(),
+        "report": format_report(result),   # 사람이 읽는 텍스트 리포트
+        "chart": result.chart,             # plotly figure (프론트가 Plotly.newPlot 으로 그린다)
+    }
+
+
+@lru_cache(maxsize=1)
+def _plotly_js() -> str:
+    """plotly.js 번들 원문 (약 4.5MB). 매 요청마다 파일을 읽지 않도록 캐시한다."""
+    from plotly.offline import get_plotlyjs
+
+    return get_plotlyjs()
+
+
+@app.get("/plotly.js")
+def plotly_js():
+    """차트 라이브러리를 직접 서빙한다.
+
+    CDN 을 쓰지 않는 이유: 네트워크가 막힌 곳에서 시연하면 차트만 빈 칸이 된다.
+    plotly 는 vectorbt 의 의존성이라 컨테이너 안에 이미 들어 있으므로 그대로 내보낸다.
+    immutable 캐시라 브라우저는 최초 1회만 받는다.
+    """
+    return Response(
+        _plotly_js(),
+        media_type="application/javascript",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 @app.get("/health")
