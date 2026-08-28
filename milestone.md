@@ -173,14 +173,21 @@ MDD(백테스트 계층 부재) · 최소 리밸런싱 간격(현행 enum 최소
   레버리지 키워드도 없다(validators.LEVERAGE_KEYWORDS import). 텍스트 전용 추가분만
   별도 키에 두고 **2계층으로 역류시키지 않는다**
 - `app/intent.py`: `scan_free_text()` → `{slots, rejections, notices}` /
-  `classify_intent()`(요구 vs 언급) / `describe_slots()`(값별 출처). **LLM 아님**
+  `classify_intent()`(요구 vs 언급) / `describe_slots()`(값별 출처 + 대조). **LLM 아님**
+- `describe_slots()` 는 **두 질문에 두 필드로** 답한다 (CLAUDE.md §19.3.1):
+  `source`(언급했는가) / `check`(매치 표현이 최종 값과 맞는가). `source` 에
+  `explicit_conflict` 같은 값을 **추가하지 않는다** — 그러면 "언급했는가"의 답이
+  대조 결과에 오염된다. `evidence` 는 `matched_term` 으로 **개명**한다(값은 남긴다 —
+  지우면 스캔이 무엇에 걸렸는지가 사라져 감사가 안 된다). `implies` 는 `check` 계산의 입력
 - `app/schemas.py`: `FreeInputRequest` 추가 (`text`, 1~2000자). 기존 모델 무수정
 - `app/prompt.py`: `build_free_system()` / `build_free_user()` / `sanitize_free_text()`.
   격리 규칙은 **자유 입력에만** 덧붙인다 — `SYSTEM_TEMPLATE` 을 고치면 설문 출력이
   달라져 M5 시나리오를 재검증해야 한다
 - `app/llm.py`: `compile_spec_from_text()`. `compile_spec()` 관측 동작 무변경
 - `app/main.py`: `POST /compile/free`, 설문 `note` 에도 같은 스캔 연결,
-  하드캡을 `_apply_hardcaps()` 공용 헬퍼로 통합
+  하드캡을 `_apply_hardcaps()` 공용 헬퍼로 통합.
+  `describe_slots(scan, spec_json, clamps)` 는 **하드캡 적용 뒤**에 호출한다 —
+  클램프에 기인한 차이를 `conflict` 로 오판하지 않으려면 조정 내역이 필요하다
 
 **하지 말 것 (제약)**
 - `StrategySpec` 변경 금지 / 새 라이브러리 금지 / `static/index.html` 수정 금지
@@ -192,9 +199,15 @@ MDD(백테스트 계층 부재) · 최소 리밸런싱 간격(현행 enum 최소
 **완료 기준**
 - `python -m app.intent` — 요구/언급 양쪽 케이스, **주입 시도**, 오탐 방지, 렉시콘
   정합성 assert 통과 (DB·Ollama 없이)
+- 슬롯 대조(§19.3.1) assert: **부정어 케이스**("너무 공격적이진 않게" → `check: conflict`),
+  클램프 3경우(요구를 깎음=consistent / 클램프 없이 다름=conflict / 클램프가 있어도
+  조정 전 값이 이미 다름=conflict), `style` = `unverifiable`,
+  `note` 의 **자립성**(약칭 금지·매치 표현과 Spec 필드명 포함)과 **원인 불단정**
+  (부정어 유무와 무관하게 note 가 동일해야 한다 — 다르면 원인을 단정하는 것)
 - `python -m app.prompt` — 설문 프롬프트 무회귀 + 하드캡·지표 미노출 + 태그 탈출 무력화
 - 자유 입력 한 단락 → 유효한 Spec. **복합 의도**("반도체 + 배당주도 섞어")가 한 Spec 에
-- 언급 안 한 슬롯이 `slots[*].source == "inferred"` 로 구분된다
+- 언급 안 한 슬롯이 `slots[*].source == "inferred"` 로 구분된다 (`check` 는 `null`)
+- 클램프가 걸린 요청에서 `slots.max_loss.check` 가 **`consistent`** (conflict 아님)
 - 유니버스 밖 섹터 **요구** → 400 + 사유 / 레버리지 **요구** → 400 + 사유
 - 맥락 **언급**만("예전에 코인으로 물려서") → **200 + `notices`** (거부 아님)
 - 주입 시도 → 200. 1층 뚫려도 2층이 형태 유지, 3층이 클램프 (`clamps` 1건)
@@ -211,6 +224,14 @@ MDD(백테스트 계층 부재) · 최소 리밸런싱 간격(현행 enum 최소
   데모 범위의 단순화이며 본 시스템에서는 해소되어야 한다
 - 요구/언급의 **완전한** 구별 — 어휘 매칭으로는 불가능하다. 경계는 통과 쪽으로
   실패시키고(fail open) 감지 사실을 `notices` 에 남긴다. 근거는 CLAUDE.md §19.3
+- `check == "conflict"` 의 **원인 구별** — ①사용자가 부정 표현을 썼고 LLM 이 옳게 읽음,
+  ②LLM 이 사용자를 무시함. 둘이 같은 관측을 낳아 구별 불가다(§19.3 요구/언급과 같은
+  계열의 한계). ②는 **현재 어느 계층도 잡지 못하는 결함**이고 `check` 는 그것을
+  고치지 않고 **보이게만** 한다 — 지금까지 완전히 보이지 않던 것이라 그것만으로도
+  이전보다 낫다. 판정은 U-5 확인 단계에서 사람이 한다. 근거는 CLAUDE.md §19.3.1
+- `style` 슬롯의 대조 — 스타일→지표 매핑이 프롬프트의 산문 규칙이라 기계가 읽는 계약이
+  아니다. `consistent` 로 뭉개지 않고 **`unverifiable`** 이라고 말한다(M8 하드캡 스텁이
+  `ok` 대신 `undecidable` 을 돌려주는 것과 같은 방침)
 
 ## 범위 밖 (이번 데모에서 안 함)
 
