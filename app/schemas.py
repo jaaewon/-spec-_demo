@@ -8,8 +8,14 @@
      모델은 스키마에서 벗어난 문자열을 **만들어낼 수가 없다.**
      (프롬프트로 "JSON 으로만 답해"라고 부탁하는 것과 근본적으로 다른 수준의 강제)
 
-  2) SurveyRequest = 사용자의 **입력** 형태
-     POST /compile 의 요청 본문을 검증한다. 외부 입력이 들어오는 신뢰 경계.
+  2) SurveyRequest / FreeInputRequest = 사용자의 **입력** 형태
+     POST /compile, POST /compile/free 의 요청 본문을 검증한다.
+     외부 입력이 들어오는 신뢰 경계.
+
+     둘의 신뢰 경계 두께가 다르다는 점이 중요하다:
+       SurveyRequest    — Enum 으로 선택지를 좁혀 막는다 (note 만 자유 텍스트).
+       FreeInputRequest — 본문 전체가 자유 텍스트라 Enum 으로 막을 게 없다.
+                          방어가 길이 상한과 프롬프트 격리(prompt.py)로 옮겨간다.
 
 Enum 을 적극적으로 쓰는 이유:
   위 1) 의 문법 제약은 Enum 을 "이 값들 중 하나"로 번역한다.
@@ -140,6 +146,31 @@ class SurveyRequest(BaseModel):
     note: str = Field(default="", max_length=500, description="자유 서술 (선택)")
 
 
+class FreeInputRequest(BaseModel):
+    """POST /compile/free 의 요청 본문 — 자유 입력 한 단락.
+
+    SurveyRequest 와 달리 Enum 이 없다. 그게 이 경로의 존재 이유다:
+    "반도체 비중은 줄이되 배당은 유지" 같은 복합 의도를 sector 단수 Enum 으로
+    접어 넣으면 상위 기획서가 지목한 '의도 표현력의 병목' 을 입력단에 다시 세우게 된다
+    (CLAUDE.md §19.1).
+
+    대신 신뢰 경계가 얇아지므로 방어를 길이와 격리로 옮긴다 — 아래 text 참고.
+    """
+
+    # max_length=2000 의 근거 (note 의 500 과 같은 방어 목적, 다른 값):
+    #   ① 자유 입력은 한 단락이 정상이라 500 으로는 기능이 성립하지 않는다.
+    #   ② 상한이 없으면 긴 지시문을 밀어넣어 시스템 규칙을 밀어내는 시도가 가능해진다.
+    #   ③ 로컬 8B 모델은 프롬프트가 길어질수록 품질이 떨어진다 (CLAUDE.md §17.2).
+    #      유니버스 13줄이 이미 시스템 프롬프트에 들어가 있다.
+    #   2000자 ≈ 한국어 700~1000 토큰. 초과하면 이 모델이 422 로 막는다 (LLM 호출 전).
+    #
+    # min_length=1 로 빈 문자열도 막는다. 빈 입력은 슬롯이 하나도 없어
+    # LLM 이 Spec 을 통째로 지어내게 되는데, 그건 "언급하지 않은 슬롯을 지어내지 마라"
+    # 요구사항과 정면으로 어긋난다.
+    text: str = Field(min_length=1, max_length=2000,
+                      description="투자 의도 자유 서술 (한 단락)")
+
+
 # --------------------------------------------------------------------------
 # 셀프체크: `docker compose exec api python -m app.schemas` 로 실행.
 # 테스트 프레임워크 없이 assert 만 쓴다. 스키마를 고쳤을 때 여기가 깨지면
@@ -192,6 +223,23 @@ if __name__ == "__main__":
             pass
         else:
             raise AssertionError(f"거부됐어야 함: {why}")
+
+    free = FreeInputRequest.model_validate({"text": "반도체 ETF를 월 1회 리밸런싱으로."})
+    assert free.text
+
+    for bad, why in [
+        ({"text": ""}, "빈 자유 입력 — 슬롯이 하나도 없어 Spec 을 통째로 지어내게 된다"),
+        ({"text": "가" * 2001}, "자유 입력 길이 상한 초과 (프롬프트 밀어내기 방어)"),
+    ]:
+        try:
+            FreeInputRequest.model_validate(bad)
+        except Exception:
+            pass
+        else:
+            raise AssertionError(f"거부됐어야 함: {why}")
+
+    # 경계값은 통과해야 한다 (상한이 '초과부터' 막는지 확인)
+    assert FreeInputRequest.model_validate({"text": "가" * 2000}).text
 
     print("ok — 스키마 검증 통과")
     print(json.dumps(schema, ensure_ascii=False)[:200] + " ...")
