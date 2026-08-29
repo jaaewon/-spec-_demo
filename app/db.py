@@ -180,3 +180,12 @@ def hardcap_status() -> str:
     return (f"ok (v{p['version']} / max_loss<={p['max_loss_pct_cap']:g}% "
             f"mdd<={p['mdd_pct_cap']:g}% rebalance>={p['min_rebalance_days']}d "
             f"single_etf<={p['single_etf_weight_cap']:g}%)")
+
+
+def get_spec(spec_id: int) -> dict | None:
+    """Spec 하나 조회. 없으면 None (main.py 에서 404 로 변환)."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT id, request_id, spec, model, created_at FROM specs WHERE id = %s",
+            (spec_id,),
+        ).fetchone()

@@ -3,7 +3,7 @@
 이 파일이 존재하는 이유:
     schemas.py 의 문법 제약은 "형태"만 강제한다. etfs 가 문자열 배열이라는 건 보장되지만,
     그 문자열이 **실재하는 종목명인지**는 스키마로 표현할 수 없다.
-    (유니버스는 JSON 파일에서 읽는 데이터라 코드에 박을 수 없기 때문)
+    (유니버스는 data/etf_universe.csv 에서 읽는 데이터라 코드에 박을 수 없기 때문)
     그래서 스키마 통과 후 한 겹 더 검사한다.
 
 기획서 4.1 의 Validator 4계층 중 이 파일이 담당하는 건 2번째와 4번째다:
@@ -27,24 +27,34 @@
     2) validate_etfs()  — 그래도 모델이 만들어낸 경우를 잡는다 (사후 검증)
 """
 
-import json
+import csv
 from pathlib import Path
 
 # __file__ = /srv/app/validators.py → .parent = /srv/app → .parent.parent = /srv
 # 이렇게 파일 위치 기준으로 경로를 잡으면 어느 디렉토리에서 실행하든 동작한다.
-UNIVERSE_PATH = Path(__file__).parent.parent / "data" / "etf_universe.json"
+UNIVERSE_PATH = Path(__file__).parent.parent / "data" / "etf_universe.csv"
 
 LEVERAGE_KEYWORDS = ("레버리지", "인버스", "2X", "곱버스")
 
 
 def load_universe(path: Path = UNIVERSE_PATH) -> list[dict]:
-    """화이트리스트 로드. 레버리지/인버스는 로드 단계에서 걸러 프롬프트에 아예 노출하지 않는다.
+    """화이트리스트 로드 (CSV: name,code,theme). 반환값은 {"name","code","theme"} dict 목록.
 
-    지금 etf_universe.json 에는 레버리지 종목이 없으므로 이 필터는 아무것도 안 거른다.
+    레버리지/인버스는 로드 단계에서 걸러 프롬프트에 아예 노출하지 않는다.
+    지금 etf_universe.csv 에는 레버리지 종목이 없으므로 이 필터는 아무것도 안 거른다.
     유니버스를 나중에 확장할 때(예: KRX 전체 목록을 긁어올 때) 자동으로 막히도록
     미리 걸어둔 안전장치.
+
+    encoding="utf-8-sig" 인 이유: Excel 로 저장한 CSV 는 맨 앞에 BOM(\\ufeff)이 붙는다.
+        그냥 "utf-8" 로 읽으면 첫 컬럼 키가 'name' 이 아니라 '\\ufeffname' 이 돼서
+        row["name"] 이 KeyError 로 터진다. -sig 는 BOM 이 있으면 떼고 없으면 그냥 넘어간다.
+    newline="" 인 이유: csv 모듈이 줄바꿈(CRLF 포함)을 직접 처리하게 두는 표준 사용법.
+
+    code 는 문자열 그대로 둔다 — "069500" 처럼 앞자리 0 이 있어서 숫자로 바꾸면 69500 이 된다.
+    (csv 모듈은 전부 str 로 읽으므로 별도 처리 불필요. pandas 를 쓸 땐 dtype={"code": str} 필수)
     """
-    items = json.loads(path.read_text(encoding="utf-8"))
+    with path.open(encoding="utf-8-sig", newline="") as f:
+        items = [row for row in csv.DictReader(f) if row.get("name")]  # 끝의 빈 줄 방어
     return [it for it in items if not _is_leveraged(it["name"])]
 
 
@@ -178,7 +188,12 @@ def check_mdd_pct(spec: dict | None, profile: dict) -> dict:
 
     spec 인자를 아예 쓰지 않는다는 것 자체가 판정 불가의 증거다:
     MDD 는 수익률 시계열에서만 나오는 값이라 Spec 을 아무리 들여다봐도 계산할 수 없다.
-    이 데모에는 백테스트 계층이 없다.
+
+    <<사유 갱신 2026-08-29>> "백테스트 계층이 없다"는 원래 사유는 소멸했다 —
+    app/backtest.py 가 max_drawdown_pct 를 실제로 산출한다. 그래도 판정을 켜지 않는 이유는
+    (a) mdd_pct_cap 절대값에 근거가 없고, (b) 백테스트는 /compile 과 별도 요청이라
+    Spec 생성 시점에는 여전히 MDD 를 모르며, (c) 백테스트의 범위 편입이 미승인이기 때문이다.
+    셋 다 팀 결정 사항이다 (CLAUDE.md §16-16).
 
     그런데도 profile 에 값(30)을 두는 이유: '1회 손실 한도(20) < MDD 상한(30)' 관계를
     지금부터 명시해 두려는 것. 절대값 30 은 잠정치이고, P3 에서 유니버스 실측 MDD 를
@@ -187,8 +202,9 @@ def check_mdd_pct(spec: dict | None, profile: dict) -> dict:
     return {
         "cap": "mdd_pct_cap", "field": None, "limit": float(profile["mdd_pct_cap"]),
         "status": STATUS_UNDECIDABLE,
-        "reason": "MDD 는 수익률 시계열에서만 산출되는데 이 데모에는 백테스트 계층이 없다. "
-                  "Spec 만으로는 판정할 수 없다 — P3 백테스트 계층에서 구현.",
+        "reason": "MDD 는 수익률 시계열에서만 산출되는데 Spec 만으로는 시계열을 알 수 없다. "
+                  "백테스트 계층(app/backtest.py)은 존재하나 /compile 과 별도 요청이고, "
+                  "캡 절대값 근거와 범위 편입이 미확정이라 판정하지 않는다 (§16-16).",
     }
 
 
@@ -263,7 +279,7 @@ def find_logical_contradictions(spec: dict) -> list[str]:
     #
     #    <<데모에서 실제 발동이 어려운 검사>>
     #    이 검사는 현재 파이프라인에서 사실상 도달할 수 없다. 이유가 둘 겹쳐 있다:
-    #      (a) data/etf_universe.json 에 레버리지/인버스 종목이 아예 없다.
+    #      (a) data/etf_universe.csv 에 레버리지/인버스 종목이 아예 없다.
     #      (b) 설령 있어도 2계층 validate_etfs() 가 하드캡보다 먼저 돌아 반려한다.
     #    그래도 남겨 두는 이유: 유니버스가 KRX 전체로 확장되고 레버리지 종목이
     #    '성향 무관하게 허용' 정책으로 바뀌는 순간, 이 검사만이 "안정형인데 레버리지"를
@@ -356,8 +372,12 @@ def undecidable_caps(profile: dict) -> list[dict]:
 if __name__ == "__main__":
     uni = load_universe()
     names = {it["name"] for it in uni}
-    assert len(uni) == 13, len(uni)
+    assert len(uni) == 20, len(uni)
     assert "KODEX 반도체" in names
+    # 앞자리 0 이 살아있는지 (숫자로 파싱되면 "69500" 이 된다)
+    assert next(it["code"] for it in uni if it["name"] == "KODEX 200") == "069500"
+    # theme 은 프롬프트에서 설문 sector 와 문자열로 매칭되므로 비어 있으면 안 된다
+    assert all(it["theme"] for it in uni)
 
     assert validate_etfs(["KODEX 반도체", "TIGER 200"], names)
 

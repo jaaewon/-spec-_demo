@@ -3,3 +3,10 @@ uvicorn[standard]==0.34.0
 pydantic==2.10.4
 ollama==0.4.5
 psycopg[binary]==3.2.3
+
+# 백테스트 (app/backtest.py, app/tickers.py)
+vectorbt==1.1.0
+pykrx==1.0.51
+plotly==5.24.1        # vectorbt 가 plotly 6+ 와 비호환 (scattermapbox 제거됨).
+                      # 번들 JS 를 /plotly.js 로 직접 서빙하므로 CDN 불필요.
+setuptools==80.10.2    # pykrx 가 pkg_resources 를 쓰는데 slim 이미지엔 없다

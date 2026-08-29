@@ -39,6 +39,8 @@ curl localhost:8000/health
 | POST | `/compile` | 설문 → Spec JSON (+ 하드캡 조정 내역 `clamps`) |
 | POST | `/compile/free` | **자유 입력 한 단락 → Spec JSON** (+ 슬롯 출처 `slots`, 통지 `notices`) — CLAUDE.md §19 |
 | GET | `/specs` | 저장 이력 (원문 + Spec) |
+| POST | `/backtest/{spec_id}` | 저장된 Spec 백테스트 → 수치 + 텍스트 리포트 + 차트 |
+| GET | `/plotly.js` | 차트 라이브러리 로컬 서빙 (CDN 없이 오프라인 시연) |
 | GET | `/indicators?as_of=` | 해당 시점에 공개돼 있던 경제지표 (CLAUDE.md §17) |
 | GET | `/health` | Ollama·DB·지표·하드캡 상태 |
 
@@ -51,6 +53,8 @@ docker compose exec api python -m app.indicators   # 경제지표 as-of 조회
 docker compose exec api python -m app.intent       # 자유 입력 사전 스캔 (요구/언급, 주입 시도)
 docker compose exec api python -m app.prompt       # 프롬프트 격리 + 하드캡·지표 미노출
 docker compose exec api python -m app.llm          # 실제 LLM 호출 (2~4분)
+docker compose exec api python -m app.tickers      # 종목명→티커 매핑이 유니버스와 맞는지 (네트워크)
+docker compose exec api python -m app.backtest     # 신호 조립 + 실제 백테스트 (네트워크, 수십 초)
 ```
 
 ## 자유 입력 (CLAUDE.md §19)
@@ -62,7 +66,9 @@ docker compose exec api python -m app.llm          # 실제 LLM 호출 (2~4분)
 curl -s -X POST localhost:8000/compile/free -H 'Content-Type: application/json' \
   -d '{"text":"반도체 쪽에 공격적으로 가고 싶은데 배당주도 조금 섞어주세요. 손실은 10%까지."}' \
   | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["spec"]["etfs"])'
-# → ['KODEX 반도체', 'TIGER 반도체', 'KODEX 배당가치']
+# → ['TIGER Fn반도체TOP10', 'KODEX 고배당주', 'KODEX 코리아배당성장']
+#   실측 2026-08-29 / qwen3:8b / 유니버스 20종. 종목 구성은 LLM 출력이라 고정이 아니다 —
+#   여기서 보이려는 건 **반도체와 배당이 한 Spec 에 함께 담긴다**는 점이다.
 ```
 
 **언급하지 않은 슬롯은 지어내지 않고 구분해서 알려준다.** `slots[*].source` 가
@@ -114,6 +120,23 @@ curl -s -X POST localhost:8000/compile/free -H 'Content-Type: application/json' 
 **1층은 하드캡을 대체하지 않는다.** 2층은 '형태'를 막지 '값'을 막지 않으므로
 (60 은 `max_loss_pct` 의 스키마 범위 0~100 안이다) 값의 최종 방어선은 3층이다.
 그래서 방어 목적이라도 **하드캡 값을 프롬프트에 넣지 않는다** (§18.2).
+## 백테스트 (CLAUDE.md §16-16)
+
+컴파일이 끝나면 프론트가 `/compile` 응답의 `spec_id` 로 `POST /backtest/{spec_id}` 를
+이어서 호출한다. 초기자본 1천만원, 기본 구간 최근 5년, 종목 균등 배분.
+pykrx 로 시세를 받아 vectorbt 로 돌리므로 한 번에 수 초~수십 초 걸린다.
+
+```bash
+# /compile 이 준 spec_id 로
+curl -s -X POST localhost:8000/backtest/1 \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["report"])'
+```
+
+종목명 → KRX 티커 매핑은 `data/etf_universe.csv` 의 `code` 컬럼에서 유도한다
+(`app/tickers.py`). 유니버스에 종목을 추가할 때 따로 손댈 곳이 없다.
+
+> ⚠️ 백테스트·리포트는 CLAUDE.md §2 에서 아직 "제외" 로 적혀 있다 —
+> **구현돼 있으나 범위 편입이 승인됐는지 확인되지 않았다** (§16-16).
 
 ## 하드캡 (CLAUDE.md §18)
 

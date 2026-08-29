@@ -21,9 +21,24 @@
 주입 방어 3층 구조는 app/prompt.py 머리말과 CLAUDE.md §19.4 참고.
 
 어휘는 코드에 박지 않는다:
-    - 섹터 positive → data/etf_universe.json 의 theme 에서 파생
+    - 섹터 positive → data/etf_universe.csv 의 theme 에서 파생
     - 레버리지 키워드 → app/validators.py 의 LEVERAGE_KEYWORDS 를 import
     - 그 외(동의어·범위 밖 자산군·요구/언급 마커) → data/intent_lexicon.json, 항목마다 reason 동봉
+
+⚠️ **유니버스와 렉시콘은 서로 의존한다. 동기화는 수동이고 자동 검증 수단이 없다.**
+    섹터 positive 를 유니버스에서 파생시켰으므로 theme 이 늘면 어휘도 따라 늘어난다.
+    그런데 _load_lexicon() 의 정합성 검사가 보는 것은 theme **키**뿐이라,
+    theme 집합이 그대로인 채 **종목만 바뀌면 어휘가 낡아도 통과한다.**
+    실제로 etf_universe.json(13종) → etf_universe.csv(20종) 확장에서 두 건이
+    셀프체크를 전부 통과한 채로 발견됐다 (근거는 intent_lexicon.json 의
+    sector_synonyms._notes, 미결 항목은 CLAUDE.md §16-18):
+      - 오탐: '미국채10년선물'(theme 채권) 추가 → '미국주식' 동의어 "미국" 이
+              "미국채" 에 부분문자열로 걸려 정상 입력이 conflict 로 표시됐다.
+      - 미탐: 'KODEX 코스피100'(theme 대형주) 추가 → 대형주 동의어에 코스피200
+              계열만 있어 사용자가 명시한 슬롯이 inferred 로 찍혔다.
+    유니버스에 종목을 추가하면 **두 방향을 모두** 볼 것 — 새 종목명이 기존 동의어에
+    부분문자열로 걸리지 않는지, 그 종목을 가리키는 흔한 표현이 빠져 있지 않은지.
+    §19.3 의 "어휘 매칭은 문장의 뜻을 읽지 못한다" 와 같은 계열의 한계다.
 """
 
 import json
@@ -64,7 +79,7 @@ def _load_lexicon(path: Path = LEXICON_PATH) -> dict:
     lex = json.loads(path.read_text(encoding="utf-8"))
 
     themes = {it["theme"] for it in load_universe()}
-    _check_keys(lex["sector_synonyms"], themes, "sector_synonyms", "etf_universe.json 의 theme")
+    _check_keys(lex["sector_synonyms"], themes, "sector_synonyms", "etf_universe.csv 의 theme")
     _check_keys(lex["risk_synonyms"], {e.value for e in RiskProfile}, "risk_synonyms", "RiskProfile")
     _check_keys(lex["style_synonyms"], {e.value for e in TradeStyle}, "style_synonyms", "TradeStyle")
     _check_keys(lex["rebalance_synonyms"], {e.value for e in RebalanceFreq},
@@ -190,11 +205,24 @@ def _scan_slots(text: str) -> dict:
         term, implies = None, None
         # 가장 앞에서 매치된 표현을 고른다. 슬롯당 하나만 기록하는 건 의도적이다 —
         # 여러 개를 모으면 "무엇이 최종 값의 근거인가"를 스캔이 판단하는 꼴이 된다.
+        #
+        # 정렬 키가 (위치 오름차순, **길이 내림차순**)인 이유:
+        #   _find() 안에는 "같은 위치에서 겹치면 긴 표현이 이긴다"는 규칙이 이미 있는데,
+        #   그건 한 테마의 terms 안에서만 돈다. 테마 **사이**의 동점을 위치만으로 가르면
+        #   승자가 dict 순회 순서(= sorted(theme))로 정해진다 — 어휘의 문제가 아니라
+        #   가나다순의 문제가 되는 것이다.
+        #   실제 사고: "미국채" 는 '채권' 의 동의어인데 '미국주식' 의 동의어 "미국" 이
+        #   같은 0번 위치에서 걸리고, sorted 상 '미국주식'(3번째) 이 '채권'(6번째) 보다
+        #   앞서서 이겼다. 정상 입력 "미국채 10년물"이 채권이 아니라 미국주식으로 찍혔다.
+        #   → 같은 규칙을 테마 사이에도 적용해 긴 표현이 이기게 한다 (CLAUDE.md §16-18).
         best = None
         for key, terms in table.items():
             hit = _find(text, terms)
-            if hit and (best is None or hit[1] < best[0]):
-                best = (hit[1], hit[0], key)
+            if hit is None:
+                continue
+            rank = (hit[1], -len(hit[0]))
+            if best is None or rank < best[0]:
+                best = (rank, hit[0], key)
         if best:
             _, term, implies = best
         slots[name] = {"mentioned": term is not None,
@@ -298,7 +326,7 @@ _CONFLICT_CAUSE = (
 def _check_sector(implies: str, term: str, spec: dict) -> tuple[str, str | None]:
     """매치된 theme 의 ETF 가 실제로 선택됐는가.
 
-    theme 판정은 etf_universe.json 에서 파생한다 — 종목명→theme 을 여기 복제하지 않는다.
+    theme 판정은 etf_universe.csv 에서 파생한다 — 종목명→theme 을 여기 복제하지 않는다.
     복합 의도("반도체 + 배당")는 picked 에 둘 다 들어가므로 오탐이 나지 않는다.
     """
     themes = {it["name"]: it["theme"] for it in load_universe()}
@@ -361,6 +389,19 @@ def _check_enum_slot(name: str, implies: str, term: str,
     """risk / rebalance — 렉시콘 키가 곧 enum 값이라 그대로 비교된다.
 
     (키가 실재하는 enum 값인지는 _check_keys 가 모듈 로드 시점에 보장한다.)
+
+    <<알려진 잠복 결함 — CLAUDE.md §16-19>>
+    이 함수는 _check_max_loss 와 달리 `clamps` 를 **받지 않는다.** 그래서 하드캡이
+    rebalance 를 조정하면 그 차이를 conflict 로 오판한다: "주 1회"라고 말한 사용자에게
+    implies=weekly vs 클램프된 spec_value=monthly 로 **허위 conflict** 가 나간다.
+    (max_loss 는 이 경우를 위해 조정 '전' 값과 대조하도록 되어 있다 — _check_max_loss)
+
+    지금은 발동하지 않는다. hardcap_profile.min_rebalance_days = 7 이 RebalanceFreq 의
+    최소 단위 weekly(7일)와 같아 check_min_rebalance_interval 이 클램프를 내지 않기
+    때문이다. **캡을 8 이상으로 올리는 순간 발동한다** (CLAUDE.md §18.1 이 "캡을 올리면
+    즉시 발동"이라고 적어둔 바로 그 지점). 캡 값 변경은 팀 결정 사항이므로 그 결정과
+    함께 고쳐야 한다 — 캡만 올리고 이걸 놔두면 정상 응답이 매번 conflict 로 표시된다.
+    고치려면 _check_slot → _check_enum_slot 시그니처에 clamps 를 통과시켜야 한다.
     """
     field = _SLOT_TO_SPEC_FIELD[name]
     value = spec.get(field)
@@ -560,13 +601,29 @@ if __name__ == "__main__":
     assert d2["risk"]["check"] == CHECK_CONSISTENT
 
     # ── ②-c 다른 슬롯의 반전도 같은 경로로 잡힌다
-    #      섹터: theme 대조를 etf_universe.json 에서 파생하므로 매핑을 복제하지 않는다
+    #      섹터: theme 대조를 etf_universe.csv 에서 파생하므로 매핑을 복제하지 않는다
+    #
+    #      <<종목명은 반드시 현행 유니버스 안에서 고른다>> 유니버스 밖 이름을 쓰면
+    #      _check_sector 의 `if n in themes` 에서 통째로 걸러져 picked 가 빈 리스트가 되고,
+    #      그러면 무엇을 담았든 conflict 가 나와 **assert 는 통과하지만 검증은 안 된다.**
+    #      (실제로 13종 → 20종 확장 때 여기 쓰인 "KODEX 배당가치" 가 유니버스에서 빠지면서
+    #       이 상태가 됐다. 검증하려던 것을 검증하지 못하는 셀프체크라 통과가 무의미했다.)
+    #      아래 두 assert 는 그 사고를 막기 위해 종목명이 유니버스 안에 있음을 먼저 확인한다.
+    dividend, semi = "KODEX 고배당주", "KODEX 반도체"
+    _uni_names = {it["name"] for it in load_universe()}
+    assert {dividend, semi} <= _uni_names, (
+        f"셀프체크가 유니버스 밖 종목을 쓰고 있다: {{dividend, semi}} - {_uni_names}")
+    assert {it["theme"] for it in load_universe() if it["name"] == dividend} == {"배당"}
+
     sec = scan("반도체 말고 배당 쪽으로 부탁해요")
-    d = assert_notes_ok(describe_slots(sec, {**spec, "etfs": ["KODEX 배당가치"]}))
+    assert sec["slots"]["sector"]["implies"] == "반도체", sec["slots"]["sector"]
+    #      배당 ETF 만 담겼다 → 매치된 '반도체' 테마가 실제로 **안 담겼음**을 확인한다.
+    #      (유니버스 안 종목이므로 picked == ["배당"] 이 실제로 계산된 뒤 대조된다)
+    d = assert_notes_ok(describe_slots(sec, {**spec, "etfs": [dividend]}))
     assert d["sector"]["check"] == CHECK_CONFLICT, d["sector"]
+    assert "배당" in d["sector"]["note"], "실제 테마 구성이 사유에 보여야 한다"
     #      복합 의도는 오탐이 아니다 — 두 테마가 다 담기면 매치된 쪽이 들어 있으므로 통과
-    d = assert_notes_ok(describe_slots(
-        sec, {**spec, "etfs": ["KODEX 반도체", "KODEX 배당가치"]}))
+    d = assert_notes_ok(describe_slots(sec, {**spec, "etfs": [semi, dividend]}))
     assert d["sector"]["check"] == CHECK_CONSISTENT, d["sector"]
     #      리밸런싱
     rb = scan("주 1회는 너무 잦으니 그건 말고요")
