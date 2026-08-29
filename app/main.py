@@ -1,8 +1,19 @@
 """FastAPI 엔드포인트 — 이 파일이 시스템의 입구.
 
+입력 경로는 둘이고 **뒷단은 완전히 같다**:
+    POST /compile      설문(선택형)  → SurveyRequest
+    POST /compile/free 자유 입력 한 단락 → FreeInputRequest (SurveyRequest 를 경유하지 않음)
+
+  ⚠️ 이름이 상위 기획서의 우선순위와 반대로 읽힌다는 점에 주의 (CLAUDE.md §19.5).
+     기획서에서 U-1 이 "자연어 전략 요청"(주 입력), U-2 가 "보조 입력 — 설문 형식"이다.
+     즉 본 시스템에서는 **자연어가 주 입력이고 설문이 보조**인데, 데모를 설문부터
+     만든 탓에 설문이 기본 경로(/compile) 이름을 먼저 차지했다.
+     구현 순서가 만든 배치일 뿐 설계 우선순위가 아니다.
+
 전체 흐름 (POST /compile 기준):
     브라우저 설문
       → SurveyRequest 로 입력 검증        (schemas.py)
+      → 자유 텍스트 사전 스캔              (intent.py)  ← note 도 자유 텍스트다
       → 프롬프트 문자열 조립               (prompt.py)
       → requests 테이블에 원문 저장        (db.py)
       → Ollama 호출 + 스키마·참조 검증      (llm.py → validators.py)  ← 1~2계층, 재시도 있음
@@ -28,9 +39,10 @@ from fastapi.responses import FileResponse, Response
 from app.db import (hardcap_status, list_specs, load_active_hardcap_profile,
                     save_request, save_spec, seed_hardcap_profile, get_spec)
 from app.indicators import get_indicators_as_of, indicators_status, seed_indicators
-from app.llm import compile_spec
-from app.prompt import build_user
-from app.schemas import StrategySpec, SurveyRequest
+from app.intent import describe_slots, scan_free_text
+from app.llm import compile_spec, compile_spec_from_text
+from app.prompt import build_free_user, build_user
+from app.schemas import FreeInputRequest, StrategySpec, SurveyRequest
 from app.validators import enforce_hardcaps
 
 # 설정은 전부 환경변수로 (docker-compose.yml 의 environment 참고).
@@ -85,6 +97,22 @@ def compile_(survey: SurveyRequest):
     # enum 을 그대로 두면 json 직렬화가 안 되므로 mode="json" 으로 원시 값(문자열)으로 변환
     payload = survey.model_dump(mode="json")
 
+    # ── 자유 텍스트 사전 스캔 (CLAUDE.md §19).
+    #
+    # 자유 입력 전용이 아니다. note 도 프롬프트에 그대로 삽입되는 자유 텍스트이고,
+    # feature/hardcap 실측에서 실제로 여기로 주입이 성공했다. 같은 함수를 두 경로가 쓴다.
+    #
+    # 이 검사가 붙으면서 §15 시나리오 2("레버리지 반도체 담아줘")의 400 이
+    # **결정적**이 된다. 이전에는 LLM 이 유니버스 안 종목을 고르면 200 이 나와
+    # 문서화된 기대 동작과 어긋났다 — 계약 쪽으로 수렴한 것이지 회귀가 아니다.
+    #
+    # 스캔이 놓치는 우회 표현은 여기서 안 잡힌다. 그건 2계층 validate_etfs 가
+    # LLM 출력 단계에서 받는다. 사전 스캔은 최종 방어선이 아니라 LLM 호출(30~60초)
+    # 전에 비용을 아끼고 주입 성공률을 낮추는 앞단이다.
+    scan = scan_free_text(payload.get("note") or "")
+    if scan["rejections"]:
+        raise HTTPException(status_code=400, detail=_rejection_detail(scan["rejections"]))
+
     # 프롬프트에 쓰는 문자열을 그대로 '원문 자연어'로 저장한다.
     # 별도 변환 코드를 만들지 않기 위해 build_user 를 재사용.
     nl_text = build_user(payload)
@@ -111,21 +139,10 @@ def compile_(survey: SurveyRequest):
     # 그러면 모델이 경계에 맞춰 생성해 클램프가 발생하지 않고, 나중에 측정할
     # "적대적 입력에 대한 하드캡 차단율"이 무의미해진다. LLM 은 하드캡을 모르는 채로
     # 만들고, 서버가 사후에 깎는다.
-    try:
-        profile = load_active_hardcap_profile()
-    except Exception as e:
-        # 지표(_as_of_snapshot)와 달리 여기서 조용히 넘어가지 않는다.
-        # 하드캡은 부가정보가 아니라 안전 계층이라, 없는 채로 Spec 을 내보내는 게
-        # 에러보다 나쁘다 (fail closed).
-        raise HTTPException(
-            status_code=503,
-            detail=f"하드캡 프로파일을 읽을 수 없어 Spec 을 낼 수 없습니다: {e}")
-
-    try:
-        spec_json, clamps = enforce_hardcaps(spec.model_dump(mode="json"), profile)
-    except ValueError as e:
-        # 구조적 위반만 여기로 온다. 수치 초과는 예외가 아니라 clamps 로 나간다.
-        raise HTTPException(status_code=400, detail=f"하드캡 구조적 위반: {e}")
+    #
+    # 자유 입력 경로와 **같은 헬퍼**를 쓴다. 경로별로 복제하면 한쪽만 캡이 안 걸리는
+    # 사고가 조용히 난다 — 안전 계층에서 가장 피해야 할 형태의 버그다.
+    spec_json, clamps, profile = _apply_hardcaps(spec)
 
     # 클램프한 결과를 1계층으로 되돌려 확인한다. 조정 로직이 스키마를 깨뜨리면
     # (예: 캡이 음수로 잘못 들어가 max_loss_pct 가 ge=0 을 위반) 저장 전에 잡힌다.
@@ -142,8 +159,109 @@ def compile_(survey: SurveyRequest):
                         profile["version"])
     # spec_id 를 돌려주는 이유: 프론트가 바로 POST /backtest/{spec_id} 를 호출할 수 있어야 한다.
     # (기존 키는 그대로 두므로 이 응답을 쓰던 쪽은 영향 없다)
-    return {"request_id": request_id, "spec_id": spec_id, "spec": spec_json,
+    body = {"request_id": request_id, "spec_id": spec_id, "spec": spec_json,
             "indicators": indicators, "clamps": clamps}
+    # notices 는 **비어 있지 않을 때만** 붙인다. 기존 시연 경로(note 가 비었거나 무해)는
+    # 응답 키 구성이 바이트 단위로 그대로 유지된다 — 설문 경로 무회귀를 위해서다.
+    if scan["notices"]:
+        body["notices"] = scan["notices"]
+    return body
+
+
+@app.post("/compile/free")
+def compile_free(req: FreeInputRequest):
+    """자유 입력 한 단락 → LLM → 검증 → 저장 → Spec 반환 (CLAUDE.md §19).
+
+    **SurveyRequest 를 경유하지 않는다(경로 2).** 자유 입력을 설문 enum 으로 접으면
+    "반도체 비중은 줄이되 배당은 유지" 같은 복합 의도가 표현 불가능해지고,
+    무엇보다 문법 제약 때문에 유니버스 밖 섹터를 **거부할 수단이 사라진다**
+    (반드시 enum 중 하나로 조용히 치환된다). §19.1~19.2 참고.
+
+    /compile 과 다른 건 앞단(입력 검증·프롬프트 조립)뿐이다. 뒷단 — 2계층 참조 검증,
+    4계층 하드캡, 지표 as-of 조회, 저장 — 은 **같은 함수를 같은 순서로** 호출한다.
+    """
+    text = req.text
+
+    # ── 결정적 사전 스캔. LLM 호출 전에 돈다 (§19).
+    scan = scan_free_text(text)
+    if scan["rejections"]:
+        # 유니버스 밖 자산군 **요구** / 레버리지·인버스 **요구**.
+        # 맥락 언급일 뿐이면 여기 안 들어오고 notices 로 빠진다 (§19.3 fail open).
+        raise HTTPException(status_code=400, detail=_rejection_detail(scan["rejections"]))
+
+    # 원문을 그대로 nl_text 로 저장한다. survey 컬럼에는 자유 입력임을 표시하고
+    # 슬롯 출처를 함께 넣는다 — 출처는 '입력에 대한 사실'이라 requests 가 제자리다.
+    # (DDL 변경이 필요 없다는 실용적 이점도 있다: survey 가 이미 JSONB 다)
+    request_id = save_request(
+        {"mode": "free", "text": text, "slots": scan["slots"]},
+        build_free_user(text))
+
+    # ── 1~2계층. 설문 경로와 동일한 함수·동일한 예외 처리.
+    try:
+        spec = compile_spec_from_text(text)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Spec 검증 실패: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"LLM 호출 실패: {e}")
+
+    # ── 4계층 하드캡. compile_spec_from_text **밖**이라는 게 중요하다 (§18.2).
+    spec_json, clamps, profile = _apply_hardcaps(spec)
+    spec = StrategySpec.model_validate(spec_json)
+    spec_json = spec.model_dump(mode="json")
+
+    indicators = _as_of_snapshot(spec.snapshot_date)
+    # spec_id 를 설문 경로와 **똑같이** 돌려준다. 값은 어차피 save_spec 이 내주고 있었고,
+    # 응답에 안 실으면 자유 입력으로 만든 Spec 만 POST /backtest/{spec_id} 를 걸 수 없다
+    # — 두 경로가 뒷단을 공유한다는 이 설계(§19)에서 비대칭이 생길 이유가 없다.
+    # (static/index.html 에는 아직 자유 입력 탭이 없다. 지금 맞추는 건 API 대칭뿐이다.)
+    spec_id = save_spec(request_id, spec_json, OLLAMA_MODEL, indicators, clamps,
+                        profile["version"])
+
+    return {
+        "request_id": request_id,
+        "spec_id": spec_id,
+        "spec": spec_json,
+        "indicators": indicators,
+        "clamps": clamps,
+        # 어떤 값이 사용자가 말한 것이고(source) 매치된 표현이 최종 값과 맞는지(check).
+        # 출처는 따로 물어볼 필요가 없다 — 언급 안 한 슬롯에 Spec 이 값을 가지면 그게 추론이다.
+        #
+        # clamps 를 넘기는 이유 (CLAUDE.md §19.3.1): 하드캡이 깎으면 matched_term("60%")과
+        # 최종 max_loss_pct(20.0)가 **필연적으로** 어긋난다. 그걸 conflict 로 부르면
+        # 오판이다 — 표현이 반전된 게 아니라 시스템이 조정한 것이다. 반드시 하드캡 적용
+        # **뒤에** 호출해야 하고(위 _apply_hardcaps 참고), 그래서 이 자리에 있다.
+        "slots": describe_slots(scan, spec_json, clamps),
+        # 거부하지 않고 통과시킨 감지 사실 (§19.3). rejections 와 자리를 나눈 이유:
+        # "코인 언급이 무시됐다" 를 사용자가 알아야 조용한 치환이 아니게 된다.
+        "notices": scan["notices"],
+    }
+
+
+def _rejection_detail(rejections: list[dict]) -> str:
+    """거부 사유 문자열. 무엇이 왜 걸렸는지가 응답에 담겨야 한다는 요구사항."""
+    return " / ".join(
+        f"[{r['category']}] '{r['term']}' — {r['reason']}" for r in rejections)
+
+
+def _apply_hardcaps(spec: StrategySpec) -> tuple[dict, list[dict], dict]:
+    """4계층 하드캡 적용. 두 경로가 공유한다 (분기하면 한쪽만 안 걸리는 사고가 난다).
+
+    프로파일을 못 읽으면 503 (fail closed). 지표가 실패해도 {} 로 넘어가 200 을
+    내는 것과 의도적으로 반대다 — 하드캡은 부가정보가 아니라 안전 계층이라
+    조용히 사라진 채로 Spec 을 내보내는 게 에러보다 나쁘다 (CLAUDE.md §18.5).
+    """
+    try:
+        profile = load_active_hardcap_profile()
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"하드캡 프로파일을 읽을 수 없어 Spec 을 낼 수 없습니다: {e}")
+    try:
+        spec_json, clamps = enforce_hardcaps(spec.model_dump(mode="json"), profile)
+    except ValueError as e:
+        # 구조적 위반만 여기로 온다. 수치 초과는 예외가 아니라 clamps 로 나간다.
+        raise HTTPException(status_code=400, detail=f"하드캡 구조적 위반: {e}")
+    return spec_json, clamps, profile
 
 
 def _as_of_snapshot(as_of: date) -> dict:
